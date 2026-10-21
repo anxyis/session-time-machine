@@ -1,0 +1,70 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  fixtures:
+    name: fixture suite (no live data)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Run the fixture suite
+        # Runs against the sanitized fixture corpus in tests/fixtures -- no
+        # harness installs, no personal transcripts, no secrets.
+        run: bash tests/run_fixtures.sh
+
+      - name: Compile check
+        run: python3 -m py_compile skills/session-time-machine/scripts/sessions.py
+
+      - name: Shell syntax check (bash 3.2 compatible)
+        run: |
+          bash -n install.sh
+          bash -n tests/run_fixtures.sh
+          # the installer must not use bash4+ constructs (macOS ships 3.2)
+          ! grep -nE 'declare -A|mapfile|readarray' install.sh
+
+      - name: Installer self-test
+        # install into a throwaway HOME and make sure the skill lands and runs
+        run: |
+          set -eu
+          T="$(mktemp -d)"
+          mkdir -p "$T/home/.claude"
+          HOME="$T/home" ./install.sh --agent claude-code
+          test -f "$T/home/.claude/skills/session-time-machine/scripts/sessions.py"
+          # the source must survive a --project --agent openclaw run
+          # (openclaw's project path collides with the repo's own skills/ dir)
+          if ./install.sh --project --agent openclaw >/dev/null 2>&1; then
+            echo "installer should have refused the source-collision install" >&2
+            exit 1
+          fi
+          test -f skills/session-time-machine/scripts/sessions.py
+          python3 "$T/home/.claude/skills/session-time-machine/scripts/sessions.py" --help >/dev/null
+          rm -rf "$T"
+
+  secret-scan:
+    name: no secrets in the repo
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Scan tracked files for credential-shaped strings
+        run: |
+          set -eu
+          fail=0
+          # patterns that should never appear in a public repo
+          if git grep -nIE 'gh[pousr]_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9]{20,}|sk-ant-[A-Za-z0-9_-]{20,}|AIza[0-9A-Za-z_-]{35}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}' -- . ; then
+            echo "::error::credential-shaped string found in the repo" >&2
+            fail=1
+          fi
+          if git grep -nIE '/home/[a-z0-9_-]+/' -- . ; then
+            echo "::error::absolute home path found in the repo" >&2
+            fail=1
+          fi
+          exit $fail

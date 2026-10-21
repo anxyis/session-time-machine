@@ -2,10 +2,11 @@
 # session-time-machine installer.
 # Copies the skill into one or more coding agents' skills directories.
 # Pure bash + coreutils; no dependencies, no network, no admin rights.
-set -euo pipefail
+# Works on bash 3.2 (stock macOS) and bash 5.x (Linux).
+set -eu
 
 SKILL="session-time-machine"
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
 SRC="$REPO_ROOT/skills/$SKILL"
 
 # agent_key | project_path | global_path
@@ -35,9 +36,7 @@ AGENTS=(
   "warp|.agents/skills|$HOME/.warp/skills"
   # Pi (earendil-works/pi) and OMP (can1357/oh-my-pi) both load user-level
   # skills from ~/.agents/skills -- verified in the pi-coding-agent dist
-  # (getHomeDir()/.agents/skills) and in the omp binary's own loader strings
-  # ("Load skills from .agent/skills and .agents/skills (project walk-up + user
-  # home)"). ~/.pi/agent and ~/.omp/agent hold their own config, not skills.
+  # (getHomeDir()/.agents/skills) and in the omp binary's own loader strings.
   "pi|.agents/skills|$HOME/.agents/skills"
   "omp|.agents/skills|$HOME/.agents/skills"
 )
@@ -52,6 +51,7 @@ Usage:
   ./install.sh --agent NAME    install for one agent (repeatable)
   ./install.sh --all           install for every known agent, detected or not
   ./install.sh --list          list known agents and whether they are detected
+  ./install.sh --dry-run       show what would happen, change nothing
   ./install.sh --uninstall     remove the skill from the selected targets
   ./install.sh --help
 
@@ -61,14 +61,18 @@ Examples:
 EOF
 }
 
-TARGETS=(); PROJECT=0; ALL=0; LIST=0; UNINSTALL=0
+TARGETS=""
+PROJECT=0; ALL=0; LIST=0; UNINSTALL=0; DRYRUN=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --project) PROJECT=1 ;;
     --global)  PROJECT=0 ;;
-    --agent)   TARGETS+=("$2"); shift ;;
+    --agent)
+      if [ $# -lt 2 ]; then echo "error: --agent needs an agent name" >&2; exit 2; fi
+      TARGETS="$TARGETS $2"; shift ;;
     --all)     ALL=1 ;;
     --list)    LIST=1 ;;
+    --dry-run) DRYRUN=1 ;;
     --uninstall) UNINSTALL=1 ;;
     --help|-h) usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage; exit 2 ;;
@@ -79,7 +83,6 @@ done
 [ -d "$SRC" ] || { echo "skill source not found: $SRC" >&2; exit 1; }
 
 # A global agent dir's *parent* is the marker that the agent is installed.
-# e.g. ~/.claude -> claude-code, ~/.config/opencode -> opencode.
 detect() {
   case "$1" in
     claude-code)     [ -d "$HOME/.claude" ] ;;
@@ -112,19 +115,27 @@ known() {
   for a in "${AGENTS[@]}"; do echo "${a%%|*}"; done
 }
 
+entry_for() {
+  for a in "${AGENTS[@]}"; do
+    if [ "${a%%|*}" = "$1" ]; then echo "$a"; return 0; fi
+  done
+  return 1
+}
+
 if [ "$LIST" = 1 ]; then
   printf '%-18s %-10s %s\n' AGENT DETECTED TARGET
   for a in "${AGENTS[@]}"; do
     k="${a%%|*}"; rest="${a#*|}"; proj="${rest%%|*}"; glob="${rest##*|}"
     if detect "$k"; then d=yes; else d=no; fi
-    printf '%-18s %-10s %s\n' "$k" "$d" "$([ "$PROJECT" = 1 ] && echo "$proj" || echo "$glob")"
+    if [ "$PROJECT" = 1 ]; then t="$proj"; else t="$glob"; fi
+    printf '%-18s %-10s %s\n' "$k" "$d" "$t"
   done
   exit 0
 fi
 
 # Resolve the list of agents to act on.
-if [ ${#TARGETS[@]} -gt 0 ]; then
-  for t in "${TARGETS[@]}"; do
+if [ -n "$TARGETS" ]; then
+  for t in $TARGETS; do
     if ! known | grep -qx "$t"; then
       echo "unknown agent: $t" >&2
       echo "known: $(known | tr '\n' ' ')" >&2
@@ -132,55 +143,96 @@ if [ ${#TARGETS[@]} -gt 0 ]; then
     fi
   done
 elif [ "$ALL" = 1 ]; then
-  TARGETS=($(known))
+  TARGETS="$(known | tr '\n' ' ')"
 else
   for a in "${AGENTS[@]}"; do
     k="${a%%|*}"
-    if detect "$k"; then TARGETS+=("$k"); fi
+    if detect "$k"; then TARGETS="$TARGETS $k"; fi
   done
-  if [ ${#TARGETS[@]} -eq 0 ]; then
+  if [ -z "$TARGETS" ]; then
     echo "No supported agents detected in \$HOME." >&2
     echo "Use --agent NAME to pick one, or --list to see what is supported." >&2
     exit 1
   fi
 fi
 
+# The payload is staged in a temp dir and moved into place, so an interrupted
+# run never leaves a half-installed skill behind.
+STAGE=""
+cleanup() { if [ -n "$STAGE" ] && [ -d "$STAGE" ]; then rm -rf "$STAGE"; fi; }
+trap cleanup EXIT INT TERM
+
 installed=0
-declare -A SEEN_DEST=()
-for t in "${TARGETS[@]}"; do
-  entry="$(for a in "${AGENTS[@]}"; do [ "${a%%|*}" = "$t" ] && { echo "$a"; break; }; done)"
+SEEN=""          # space-separated list of destinations already handled
+for t in $TARGETS; do
+  entry="$(entry_for "$t")"
   proj="${entry#*|}"; proj="${proj%%|*}"; glob="${entry##*|}"
-  base="$([ "$PROJECT" = 1 ] && echo "$proj" || echo "$glob")"
+  if [ "$PROJECT" = 1 ]; then base="$proj"; else base="$glob"; fi
   dest="$base/$SKILL"
-  # several agents can share one directory (pi/omp/zed all use .agents/skills)
-  # -- install once, then just record the alias
-  if [ -n "${SEEN_DEST[$dest]:-}" ]; then
-    echo "installed $dest (shared with ${SEEN_DEST[$dest]})"
+
+  # Several agents can share one directory (pi/omp/zed all use .agents/skills).
+  # Install once, then just note the alias.
+  case " $SEEN " in
+    *" $dest "*) echo "  skip    $dest (shared with another agent)"; continue ;;
+  esac
+  SEEN="$SEEN $dest"
+
+  # GUARD: the destination must never be the source tree. Some agents use a
+  # project path that collides with the repo layout (openclaw uses "skills/",
+  # which IS the repo's own skills/ dir) -- installing there would delete the
+  # source and then try to copy from the deleted source.
+  src_abs="$(cd "$SRC" && pwd)"
+  dest_parent="$(cd "$(dirname "$dest")" 2>/dev/null && pwd || echo "$PWD/$(dirname "$dest")")"
+  dest_abs="$dest_parent/$(basename "$dest")"
+  if [ "$dest_abs" = "$src_abs" ]; then
+    echo "REFUSING: $dest is the skill source itself." >&2
+    echo "  (openclaw's project path 'skills/' collides with the repo layout)" >&2
+    echo "  use the global path instead:  ./install.sh --agent openclaw" >&2
+    exit 1
+  fi
+
+  if [ "$DRYRUN" = 1 ]; then
+    if [ "$UNINSTALL" = 1 ]; then
+      echo "  would remove  $dest"
+    else
+      echo "  would install $dest"
+    fi
     continue
   fi
-  SEEN_DEST[$dest]="$t"
 
   if [ "$UNINSTALL" = 1 ]; then
     if [ -d "$dest" ]; then
       rm -rf "$dest"
-      echo "removed  $dest"
+      echo "  removed  $dest"
       installed=$((installed+1))
     fi
     continue
   fi
 
-  mkdir -p "$dest"
-  # replace the payload, keep anything else already there
-  rm -rf "$dest/scripts" "$dest/references"
-  cp -R "$SRC/scripts" "$dest/scripts"
-  [ -d "$SRC/references" ] && cp -R "$SRC/references" "$dest/references"
-  cp "$SRC/SKILL.md" "$dest/SKILL.md"
-  # strip any .pyc noise
-  find "$dest" -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
-  find "$dest" -name '*.pyc' -delete 2>/dev/null || true
-  echo "installed $dest"
+  # stage -> move, so the skill dir is never half-written
+  if [ -z "$STAGE" ]; then
+    STAGE="$(mktemp -d 2>/dev/null || mktemp -d -t stm)"
+  fi
+  stage_skill="$STAGE/$SKILL"
+  rm -rf "$stage_skill"
+  mkdir -p "$stage_skill"
+  cp -R "$SRC/scripts" "$stage_skill/scripts"
+  if [ -d "$SRC/references" ]; then cp -R "$SRC/references" "$stage_skill/references"; fi
+  cp "$SRC/SKILL.md" "$stage_skill/SKILL.md"
+  find "$stage_skill" -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
+  find "$stage_skill" -name '*.pyc' -delete 2>/dev/null || true
+
+  mkdir -p "$(dirname "$dest")"
+  rm -rf "$dest"
+  mv "$stage_skill" "$dest"
+  echo "  installed $dest"
   installed=$((installed+1))
 done
+
+if [ "$DRYRUN" = 1 ]; then
+  echo "dry run -- nothing changed."
+  exit 0
+fi
 
 if [ "$UNINSTALL" = 1 ]; then
   echo "removed $installed target(s)."

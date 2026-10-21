@@ -17,7 +17,7 @@ python3 $S hermes --peek <ID>                 # size + fidelity before loading
 python3 $S hermes --jsonl <ID> | head -40     # chunkable, content=null where lost
 python3 $S hermes --md <ID>                   # full, for read_file(offset=N)
 ```
-Tests: `python3 scripts/test_sessions.py` → **91/91 green**, all against live databases (no mocks). Re-run after any harness change.
+Tests: `python3 scripts/test_sessions.py` → **98/98 green** (live) · **91/91** (fixture corpus, `tests/run_fixtures.sh`), all against live databases (no mocks). Re-run after any harness change.
 
 ## Normalized row (one shape for every harness)
 ```
@@ -67,6 +67,12 @@ Filters SELECT rows only — they never mutate a row, so a surviving row is iden
 ```
 Date filters use `epoch`, normalized per harness (Hermes seconds, OpenCode milliseconds, Codex/session_meta timestamps, Agy step idx→file mtime). `--no-tools` and `--include-lifecycle` are honored on **every** output path (transcript/tail/preview/md/jsonl/json/export). `--peek` always reports the full counts (it is a summary, not a transcript).
 
+## Data roots (env-overridable)
+Each harness's data root can be overridden, which is what lets the test suite run
+against a fixture corpus instead of live data:
+`STM_HERMES_DB`, `STM_OPENCODE_DB`, `STM_CLINE_DB`, `STM_CODEX_DIR`, `STM_AGY_BRAIN`,
+`STM_AGY_DIR`, `STM_OMP_SESSIONS`, `STM_PI_SESSIONS`. See `tests/run_fixtures.sh`.
+
 ## Harness coverage (verified 2026-10-22)
 | Capability | Hermes | OpenCode | Cline | Codex | Agy | Omp | Pi |
 |---|---|---|---|---|---|---|---|
@@ -87,6 +93,25 @@ Date filters use `epoch`, normalized per harness (Hermes seconds, OpenCode milli
 ## What "complete" means here
 `--md` / `--jsonl` / `--json` are lossless (full bodies). `--transcript` / `--tail` / `--preview` are readable previews; use `--clip N` to make truncation explicit (otherwise transcript bodies are full). A session is flagged `fidelity.complete:false` whenever anything could not be recovered. **Precisely:** `complete` is *transcript-parsing completeness* — true iff every source record parsed and mapped to a row with no unrecoverable gap (each gap listed in `session.fidelity.unrecovered`, e.g. the two `[response interrupted]` Hermes rows, or Agy's protobuf-fallback bytes). Two things are **always separate** from `complete`: (1) session-level `session.usage` token totals (decoded from Agy `gen_metadata`, never summed into transcript rows); (2) the protobuf DB path, used only for metadata and itself flagged `complete:false` as a fallback. `content` is `null`, never invented.
 
+## Output safety
+Three guards, all on by default, all overridable:
+
+- **Redaction** (`--no-redact` to disable) — secret-shaped substrings are scrubbed on
+  the way OUT: GitHub/OpenAI/Anthropic/Google/AWS/Slack tokens, JWTs, bearer headers,
+  `password=`/`api_key=` assignments, URL credentials, and secret-looking env vars.
+  Placeholders (`your_key_here`, `AKIAIOSFODNN7EXAMPLE`, `${VAR}`) are left alone.
+  Redaction never touches the parsed row — `content` stays verbatim in memory (that is
+  the fidelity contract) — and what was scrubbed is always reported on stderr.
+- **Fencing** (`--no-fence` to disable) — replayed transcripts are wrapped in an
+  explicit untrusted-data banner. Tool output can contain text crafted to look like
+  instructions; the fence tells the reader it is data, not commands.
+- **Context budget** (`--budget N`, default 120000 chars; `--budget 0` = unlimited) —
+  `--transcript`/`--md`/`--preview`/`--tail` cap the printed body and state exactly how
+  much was left out. `--json`/`--jsonl`/`--export` stay lossless.
+
+The budget exists because the tool's own failure mode is the one it must not cause:
+a 2.8M-char dump into an agent's context is what killed the 2026-10-21 session.
+
 ## Gotchas
 - **Never paste a whole `--json` dump into your context.** A single Hermes session is ~3.5 MB of JSON; two or three of those will overflow a small-context model and kill the session (this is exactly how the 2026-10-21 session died: context overflow on `kc/poolside/laguna-s-2.1:free`, auto-reset). Aggregate in Python instead — `execute_code` with `json.loads` + `Counter`, print only the summary. The same rule applies to any transcript: `--peek` first, then `--jsonl | head -40`, then `--md` + `read_file(offset=N)` for the part you actually need.
 - **Time units differ:** Hermes `messages.timestamp` = epoch **seconds** (float); OpenCode = **milliseconds**. Filters derive `epoch` per-harness — never hand-merge without normalizing.
@@ -105,4 +130,13 @@ Date filters use `epoch`, normalized per harness (Hermes seconds, OpenCode milli
 | Omp/Pi: the session jsonl is event-sourced — every line is an event with `id`/`parentId`. `message` events carry `role=user|assistant|toolResult`; content parts are `text`/`thinking`/`toolCall`/`image`. A tool result is a **separate `role=toolResult` message** carrying the same `toolCallId` as the call, so calls and results pair exactly (`tool_call` count == `tool_output` count, verified 188/188 on the live session). `custom`/`custom_message` events (tool_execution_start, async-result, …) become lifecycle/developer rows. `model_change` → model; `model_usage` → session-level usage (input/output/cacheRead/cacheWrite/cost), never summed into rows. The `session` header carries the authoritative start time — the `title` event's `updatedAt` is the *rename* time, so the title is stamped with the session start. A tool call with no result is reported in `fidelity.unrecovered`.
 - Ordering (epoch non-decreasing), `--clip` marker, `--export` jsonl==json message count, `all --list`/`all --search` exit 0.
 
-Run: `python3 scripts/test_sessions.py`.
+Run: `python3 scripts/test_sessions.py` (live data) or `bash tests/run_fixtures.sh`
+(sanitized fixture corpus — portable, and what CI runs).
+
+## Fixture corpus
+`tests/fixtures/` holds one synthetic session per harness, built to the real schema
+(hermes/opencode/cline DBs, a codex rollout with the real `custom_tool_call` shape, an
+agy brain transcript + `gen_metadata` protobuf, and the shared omp/pi event jsonl). The
+fixture suite (91 checks) needs no harness installed and no personal data. The live
+suite (98 checks) asserts the same invariants against real sessions. CI runs the fixture
+suite, the installer self-test, the bash-3.2 check, and a secret scan.

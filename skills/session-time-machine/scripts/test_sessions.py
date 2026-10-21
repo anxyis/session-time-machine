@@ -241,6 +241,80 @@ def main():
         check(f"{harness} fidelity reported",
               "complete" in o.get("session", {}).get("fidelity", {}),
               str(o.get("session", {}).get("fidelity", {}))[:120])
+    # ---- output safety: redaction, fencing, budget -------------------
+    # A synthetic session is the only way to assert redaction without
+    # depending on whatever secrets happen to live in the author's data.
+    import tempfile, os, json as _json
+    tmpdir = tempfile.mkdtemp(prefix="stm_safety_")
+    try:
+        # build a fake omp session containing a real-looking secret
+        sess_dir = os.path.join(tmpdir, "agent", "sessions", "-proj")
+        os.makedirs(sess_dir, exist_ok=True)
+        sid = "2026-01-01T00-00-00-000Z_00000000-0000-0000-0000-000000000000"
+        fp = os.path.join(sess_dir, sid + ".jsonl")
+        # a SYNTHETIC secret: shaped like a real key so the redaction path is
+        # exercised, but not a credential for anything.
+        secret = "sk-EXAMPLEKEYFORTESTSONLY0123456789"
+        events = [
+            {"type": "session", "id": "00000000-0000-0000-0000-000000000000",
+             "timestamp": "2026-01-01T00:00:00.000Z", "cwd": "/proj", "version": "3"},
+            {"type": "message", "id": "m1", "parentId": None,
+             "timestamp": "2026-01-01T00:00:01.000Z",
+             "message": {"role": "user", "content": [{"type": "text", "text": "hi"}],
+                         "timestamp": 1767225601000}},
+            {"type": "message", "id": "m2", "parentId": "m1",
+             "timestamp": "2026-01-01T00:00:02.000Z",
+             "message": {"role": "assistant", "content": [
+                 {"type": "toolCall", "id": "call_1", "name": "bash",
+                  "arguments": {"command": "cat env"}}],
+                 "timestamp": 1767225602000}},
+            {"type": "message", "id": "m3", "parentId": "m2",
+             "timestamp": "2026-01-01T00:00:03.000Z",
+             "message": {"role": "toolResult", "toolCallId": "call_1", "toolName": "bash",
+                         "content": [{"type": "text", "text": "OPENAI_API_KEY=" + secret}],
+                         "timestamp": 1767225603000}},
+        ]
+        with open(fp, "w") as fh:
+            for e in events:
+                fh.write(_json.dumps(e) + "\n")
+
+        env = dict(os.environ)
+        # point the omp/pi session roots at our synthetic session -- via the
+        # env override, so this works in both live and fixture mode
+        env["STM_OMP_SESSIONS"] = os.path.join(tmpdir, "agent", "sessions")
+        env["STM_PI_SESSIONS"] = os.path.join(tmpdir, "agent", "sessions")
+        env["HOME"] = tmpdir
+
+        def run_home(*a):
+            return subprocess.run([PY, S, *a], capture_output=True, text=True, env=env)
+
+        o = run_home("omp", "--json", sid)
+        out = o.stdout
+        check("safety: secret is redacted by default", secret not in out,
+              "SECRET LEAKED")
+        check("safety: redaction is reported", "[REDACTED" in out or "REDACTED" in out,
+              out[-160:])
+        o2 = run_home("omp", "--json", sid, "--no-redact")
+        check("safety: --no-redact keeps the raw secret",
+              secret in o2.stdout, "redaction could not be disabled")
+
+        t = run_home("omp", "--transcript", sid)
+        check("safety: transcript is fenced as untrusted data",
+              "BEGIN UNTRUSTED CONTENT" in t.stdout, t.stdout[:120])
+        t2 = run_home("omp", "--transcript", sid, "--no-fence")
+        check("safety: --no-fence removes the fence",
+              "BEGIN UNTRUSTED CONTENT" not in t2.stdout, t2.stdout[:120])
+
+        b = run_home("omp", "--transcript", sid, "--budget", "10")
+        check("safety: --budget marks what it did not print",
+              "budget" in b.stdout.lower(), b.stdout[:160])
+        b0 = run_home("omp", "--transcript", sid, "--budget", "0")
+        check("safety: --budget 0 prints everything",
+              len(b0.stdout) >= len(b.stdout), f"{len(b0.stdout)} vs {len(b.stdout)}")
+    finally:
+        import shutil
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
     # cross-harness
     check("all --list exits 0", run("all","--list").returncode == 0)
     check("all --search exits 0", run("all","--search","the").returncode == 0)

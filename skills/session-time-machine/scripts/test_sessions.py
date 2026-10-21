@@ -441,6 +441,89 @@ def main():
                 except OSError:
                     pass
 
+    # ---- fuzz every redaction pattern ----------------------------------
+    # One pattern had a quadratic blowup (the env-var matcher: \s* after a
+    # (?m)^ anchor, and \s matches newlines). Fuzz ALL patterns with a hard
+    # budget so the next one is caught before it ships. The bound is
+    # deliberately generous -- this catches a blowup, it is not a benchmark.
+    import time as _t2
+    _BUDGET = 5.0
+    _N = 400_000
+    _payloads = [
+        ("whitespace run", " " * _N),
+        ("newline run", "\n" * _N),
+        ("repeated =", "=" * _N),
+        ("repeated -", "-" * _N),
+        ("repeated _", "_" * _N),
+        ("key= + spaces", ("api_key=" + " " * 200 + "\n") * (_N // 210)),
+        ("key= + newlines", ("api_key=" + "\n" * 200) * (_N // 210)),
+        ("near-miss env", ("A_KEY=" + "a" * 38 + "\n") * (_N // 46)),
+        ("near-miss url", ("http://u:" + "p" * 30 + "@h\n") * (_N // 45)),
+        ("near-miss bearer", ("Bearer " + "b" * 30 + "\n") * (_N // 37)),
+        ("colon+equals", ("a:" + "=" * 30 + "\n") * (_N // 32)),
+        ("quoted values", ("api_key=\"" + "a" * 30 + "\"\n") * (_N // 42)),
+        ("brace runs", ("{" * 100 + "}" * 100 + "\n") * (_N // 201)),
+        ("percent runs", "%" * _N),
+        ("dollar brace", ("${" + "A" * 30 + "}\n") * (_N // 34)),
+        ("mixed soup", ("api_key=sk-AAA BBB=CCC " * 40 + "\n") * (_N // 880)),
+    ]
+    import sessions as _S
+    _pats = list(_S._SAFETY_COMPILED) + [("env-var", _S._SAFETY_ENV_LINE)]
+    _slow = []
+    for _pn, _rx in _pats:
+        for _pl, _payload in _payloads:
+            _t0 = _t2.time()
+            try:
+                _rx.sub(lambda m: m.group(0), _payload)
+            except Exception as _e:
+                _slow.append(f"{_pn}/{_pl}: raised {_e}")
+                continue
+            _dt = _t2.time() - _t0
+            if _dt > _BUDGET:
+                _slow.append(f"{_pn}/{_pl}: {_dt:.1f}s")
+    check(f"safety: all {len(_pats)} redaction patterns resist pathological input",
+          not _slow, "; ".join(_slow[:4]))
+
+    # ---- locked-db snapshot hardening -----------------------------------
+    # The copy is not atomic (a writer can checkpoint between the db and
+    # -wal copies), so it is retried until quick_check passes, the copy is
+    # 0600, and the connection is flagged as snapshot-derived.
+    import stat as _stat
+    try:
+        import sessions as _S2
+        _tmpdb2 = os.path.join(tempfile.gettempdir(), "stm_lock2_test.db")
+        for _p in (_tmpdb2, _tmpdb2 + "-wal", _tmpdb2 + "-shm"):
+            if os.path.exists(_p):
+                os.remove(_p)
+        _c2 = _sq.connect(_tmpdb2)
+        _c2.execute("create table t (a int)")
+        _c2.execute("insert into t values (1)")
+        _c2.commit()
+        _c2.close()
+        _w2 = _sq.connect(_tmpdb2, timeout=1)
+        _w2.execute("begin exclusive")
+        _w2.execute("insert into t values (2)")
+        try:
+            _r2 = _S2.ro(_tmpdb2)
+            try:
+                check("safety: a locked db is read as a flagged snapshot",
+                      _S2.ro_is_snapshot(_r2), "not flagged")
+                _perms = []
+                for _d in list(_S2._ro_tmpdirs):
+                    for _f in os.listdir(_d):
+                        _perms.append(_stat.S_IMODE(os.stat(os.path.join(_d, _f)).st_mode))
+                check("safety: the snapshot copy is 0600",
+                      bool(_perms) and all(m == 0o600 for m in _perms),
+                      str([oct(m) for m in _perms]))
+            finally:
+                _r2.close()
+                _S2.ro_cleanup()
+        finally:
+            _w2.rollback()
+            _w2.close()
+    except Exception as _e:
+        check("safety: locked-db snapshot handling", False, str(_e)[:80])
+
     # cross-harness
     check("all --list exits 0", run("all","--list").returncode == 0)
     check("all --search exits 0", run("all","--search","the").returncode == 0)

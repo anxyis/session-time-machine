@@ -95,29 +95,68 @@ def ro(path):
             raise
     except sqlite3.OperationalError:
         pass
-    # locked -- fall back to a temp copy
-    tmpdir = tempfile.mkdtemp(prefix="stm_ro_")
-    dest = os.path.join(tmpdir, os.path.basename(path))
-    try:
-        shutil.copy2(path, dest)
-        for side in ("-wal", "-shm"):
-            if os.path.exists(path + side):
-                shutil.copy2(path + side, dest + side)
-        con = sqlite3.connect(f"file:{dest}?mode=ro", uri=True)
+    # Locked -- fall back to a temp copy.
+    #
+    # Copying db then -wal is NOT atomic: a writer checkpointing between the
+    # two copies can leave a torn or stale snapshot. So the copy is retried
+    # until PRAGMA quick_check passes on the COPY itself, and the resulting
+    # connection is flagged as snapshot-derived so callers can say so.
+    last = None
+    for _attempt in range(4):
+        tmpdir = tempfile.mkdtemp(prefix="stm_ro_")
+        dest = os.path.join(tmpdir, os.path.basename(path))
         try:
-            con.execute("select count(*) from sqlite_master").fetchone()
-        except sqlite3.Error:
-            con.close()
-            raise
-        _ro_tmpdirs.add(tmpdir)
-        return con
-    except Exception:
-        shutil.rmtree(tmpdir, ignore_errors=True)
-        raise
+            shutil.copy2(path, dest)
+            for side in ("-wal", "-shm"):
+                if os.path.exists(path + side):
+                    shutil.copy2(path + side, dest + side)
+            # the copy holds unredacted transcripts: owner-only, always
+            os.chmod(dest, 0o600)
+            for side in ("-wal", "-shm"):
+                if os.path.exists(dest + side):
+                    os.chmod(dest + side, 0o600)
+            con = sqlite3.connect(f"file:{dest}?mode=ro", uri=True)
+            try:
+                qc = con.execute("PRAGMA quick_check").fetchone()
+                if not qc or str(qc[0]).lower() != "ok":
+                    con.close()
+                    last = "quick_check: %s" % (qc[0] if qc else "?")
+                    shutil.rmtree(tmpdir, ignore_errors=True)
+                    continue          # torn copy -- retry
+                con.execute("select count(*) from sqlite_master").fetchone()
+            except sqlite3.Error:
+                con.close()
+                raise
+            _ro_tmpdirs.add(tmpdir)
+            _ro_snapshots[id(con)] = tmpdir
+            return con
+        except Exception as e:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            last = e
+            break
+    raise sqlite3.OperationalError(
+        "database is locked and no consistent snapshot could be taken"
+        + (f" ({last})" if last else ""))
 
 
 # temp dirs created for locked-db fallbacks, cleaned at exit
 _ro_tmpdirs = set()
+# connections that are reading a SNAPSHOT copy rather than the live db
+_ro_snapshots = {}
+
+
+def ro_is_snapshot(con):
+    """True if this connection reads a temp snapshot copy (the live db was
+    locked). Callers should say so in their output."""
+    return id(con) in _ro_snapshots
+
+
+def ro_cleanup():
+    """Remove every temp snapshot. Called on exit and on signals."""
+    for d in list(_ro_tmpdirs):
+        shutil.rmtree(d, ignore_errors=True)
+    _ro_tmpdirs.clear()
+    _ro_snapshots.clear()
 
 # ---------- time helpers (epoch s / epoch ms / ISO -> IST) ----------
 
@@ -2295,6 +2334,18 @@ def _do_list(tool, n, a):
     elif tool == "agy": agy_list(n)
     elif tool in ("omp", "pi"): omp_print_list(n, tool)
 
+def _install_cleanup_handlers():
+    """Remove temp snapshots on exit, crash, SIGINT and SIGTERM."""
+    import atexit
+    import signal
+    atexit.register(ro_cleanup)
+    for _sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(_sig, lambda s, f: (ro_cleanup(), sys.exit(130)))
+        except (ValueError, OSError, AttributeError):
+            pass
+
+
 def main():
     global _REDACT, _FENCE
     ap = argparse.ArgumentParser(description="Universal AI conversation inspector.")
@@ -2341,6 +2392,7 @@ def main():
     ap.add_argument("--clip", type=int, metavar="N", help="truncate display body to N chars (explicit marker)")
     a = ap.parse_args()
     if a.redact is not None: _REDACT = a.redact
+    _install_cleanup_handlers()
     if getattr(a, "budget", None) is not None and a.budget <= 0:
         global _BUDGET
         _BUDGET = None
@@ -2384,5 +2436,4 @@ if __name__ == "__main__":
     try:
         main()
     finally:
-        for _d in list(_ro_tmpdirs):
-            shutil.rmtree(_d, ignore_errors=True)
+        ro_cleanup()

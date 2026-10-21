@@ -1,1 +1,0 @@
-[{"type": "say", "say": "user", "text": "build me a thing", "ts": 1000}, {"type": "say", "say": "assistant", "text": "on it", "ts": 1001}, {"type": "ask", "ask": "read", "tool": "read_file", "text": "file body", "ts": 1002, "partial": false}, {"type": "say", "say": "tool_result", "text": "file body", "ts": 1003, "tool": "read_file"}]

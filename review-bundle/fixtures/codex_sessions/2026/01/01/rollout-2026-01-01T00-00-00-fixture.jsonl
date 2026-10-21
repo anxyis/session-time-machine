@@ -1,6 +1,0 @@
-{"type": "session_meta", "payload": {"session_id": "2026-01-01T00-00-00-fixture", "id": "2026-01-01T00-00-00-fixture", "timestamp": "2026-01-01T00:00:00.000Z", "cwd": "/proj", "originator": "fixture", "cli_version": "0.0.0"}}
-{"type": "turn_context", "payload": {"model": "gpt-test", "cwd": "/proj", "timestamp": "2026-01-01T00:00:00.000Z"}}
-{"type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hello codex"}]}}
-{"type": "response_item", "payload": {"type": "custom_tool_call", "id": "ctc_fixture01", "status": "completed", "call_id": "call_fixture01", "name": "exec", "input": "const r = await tools.exec_command({\"cmd\":\"ls\"})"}}
-{"type": "response_item", "payload": {"type": "custom_tool_call_output", "id": "ctco_fixture01", "call_id": "call_fixture01", "output": [{"type": "input_text", "text": "a.txt"}]}}
-{"type": "response_item", "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "done"}]}}

@@ -10,8 +10,9 @@
   <img src="https://img.shields.io/badge/Python-3.9%2B-blue.svg" alt="Python 3.9+" />
   <img src="https://img.shields.io/badge/deps-none-5865F2" alt="No dependencies" />
   <img src="https://img.shields.io/badge/harnesses-7-ff69b4" alt="7 harnesses" />
-  <img src="https://github.com/anxyis/session-time-machine/actions/workflows/test.yml/badge.svg" alt="CI" />
-  <img src="https://img.shields.io/badge/tests-91%2F91%20green-4CAF50" alt="91/91 tests" />
+  <img src="https://github.com/anxyis/session-time-machine/actions/workflows/test.yml/badge.svg?branch=main" alt="CI" />
+  <img src="https://img.shields.io/badge/fixture%20suite-91%2F91-4CAF50" alt="91/91 fixture tests" />
+  <img src="https://img.shields.io/badge/live%20suite-98%2F98-4CAF50" alt="98/98 live tests" />
 </p>
 
 <br/>

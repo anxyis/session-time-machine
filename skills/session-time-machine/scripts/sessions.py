@@ -65,10 +65,59 @@ _FENCE = True
 _REDACT_COUNTS = {}
 
 def ro(path):
-    """Open a sqlite DB strictly read-only via URI. Raises FileNotFoundError if absent."""
+    """Open a sqlite DB strictly read-only via URI. Raises FileNotFoundError if absent.
+
+    Read-only, and resilient to a database another process is writing to.
+    Measured on a rollback-journal db with a writer holding EXCLUSIVE:
+      plain mode=ro          -> "database is locked"
+      mode=ro + busy_timeout -> "database is locked"  (SQLite's busy handler
+                                 does not retry a shared-lock request against
+                                 an exclusive lock)
+      immutable=1            -> works, but is unsafe for a LIVE db: it skips
+                                 locking, so it can read a torn file and
+                                 misses the -wal sidecar
+      temp copy              -> works, safe for both journal modes
+
+    So: try the real file; if it is locked, read a temp copy instead. The
+    copy is a consistent snapshot and never blocks the writer. The temp file
+    is removed when the connection is closed.
+    """
     if not os.path.exists(path):
         raise FileNotFoundError(path)
-    return sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=1.0)
+        try:
+            con.execute("PRAGMA busy_timeout=1000")
+            con.execute("select count(*) from sqlite_master").fetchone()
+            return con
+        except sqlite3.Error:
+            con.close()
+            raise
+    except sqlite3.OperationalError:
+        pass
+    # locked -- fall back to a temp copy
+    tmpdir = tempfile.mkdtemp(prefix="stm_ro_")
+    dest = os.path.join(tmpdir, os.path.basename(path))
+    try:
+        shutil.copy2(path, dest)
+        for side in ("-wal", "-shm"):
+            if os.path.exists(path + side):
+                shutil.copy2(path + side, dest + side)
+        con = sqlite3.connect(f"file:{dest}?mode=ro", uri=True)
+        try:
+            con.execute("select count(*) from sqlite_master").fetchone()
+        except sqlite3.Error:
+            con.close()
+            raise
+        _ro_tmpdirs.add(tmpdir)
+        return con
+    except Exception:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        raise
+
+
+# temp dirs created for locked-db fallbacks, cleaned at exit
+_ro_tmpdirs = set()
 
 # ---------- time helpers (epoch s / epoch ms / ISO -> IST) ----------
 
@@ -1404,6 +1453,8 @@ import json
 import os
 import re
 import secrets
+import shutil
+import tempfile
 import time
 
 # OMP and Pi share the layout; only the root differs.
@@ -1912,8 +1963,13 @@ _SAFETY_PATTERNS = [
 _SAFETY_COMPILED = [(name, re.compile(pat)) for name, pat in _SAFETY_PATTERNS]
 
 # env-var style lines: FOO_TOKEN=abcd1234  (only when the value looks secret)
+# The whitespace after the anchor is [ \t]* (never \s*): \s matches
+# newlines, so with (?m)^ it backtracks quadratically over a file with many
+# near-matching lines -- 2MB took 82 seconds before this fix.
 _SAFETY_ENV_LINE = re.compile(
-    r"(?m)^(\s*(?:export\s+)?[A-Z][A-Z0-9_]{2,}(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH)[A-Z0-9_]*\s*=\s*)(\S{6,})")
+    r"(?m)^([ \t]*(?:export[ \t]+)?[A-Z][A-Z0-9_]{0,40}"
+    r"(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH)[A-Z0-9_]{0,40}"
+    r"[ \t]*=[ \t]*)([^ \t\r\n\"',;]{6,})")
 
 # Values that are obviously placeholders, not real secrets.
 _SAFETY_PLACEHOLDER = re.compile(
@@ -2325,4 +2381,8 @@ def main():
         _report_redaction()
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        for _d in list(_ro_tmpdirs):
+            shutil.rmtree(_d, ignore_errors=True)

@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-import subprocess, json, os, sys, re
+import subprocess, json, os, sys, re, tempfile
 from collections import Counter
 # resolve sessions.py next to this file so the suite runs from any install location
 S = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sessions.py")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from sessions import safety_redact  # noqa: E402
 PY = sys.executable
 P=F=0
 def run(*a):
@@ -381,6 +383,63 @@ def main():
                     check("capture omp carries toolCallId pairing",
                           any("toolCallId" in _json2.dumps(r) for r in rows),
                           "no toolCallId found")
+
+    # ---- audit regressions: ReDoS + locked db -------------------------
+    # The env-var redaction pattern used \s* after a (?m)^ anchor, which
+    # backtracked quadratically: 2MB of near-matching lines took 82 SECONDS.
+    # That is a DoS on any transcript-shaped input. Keep it fast.
+    import time as _time
+    _patho = ("api_key=" + "a" * 40 + "\n") * 50000
+    _t0 = _time.time()
+    _out, _cnt = safety_redact(_patho, True)
+    _dt = _time.time() - _t0
+    check("safety: redaction is not ReDoS-prone on adversarial input",
+          _dt < 2.0, f"{_dt:.2f}s on {len(_patho)/1e6:.1f}MB")
+    # and it must still catch a real env-var secret
+    _o2, _c2 = safety_redact("OPENAI_API_KEY=sk-abcdefghijklmnop", True)
+    check("safety: env-var secrets are still caught", bool(_c2), str(_c2))
+    # placeholders stay placeholders
+    _o3, _c3 = safety_redact("api_key: ${VANSROUTER_KEY}", True)
+    check("safety: placeholder references are not redacted", not _c3, "false positive")
+
+    # A database locked by another writer must not kill the run: we wait.
+    import sqlite3 as _sq
+    _tmpdb = os.path.join(tempfile.gettempdir(), "stm_lock_test.db")
+    for _p in (_tmpdb, _tmpdb + "-wal", _tmpdb + "-shm"):
+        if os.path.exists(_p):
+            os.remove(_p)
+    try:
+        _c = _sq.connect(_tmpdb)
+        _c.execute("create table t (a int)")
+        _c.execute("insert into t values (1)")
+        _c.commit()
+        _c.close()
+        _w = _sq.connect(_tmpdb, timeout=1)
+        _w.execute("begin exclusive")
+        _w.execute("insert into t values (2)")   # hold the write lock
+        try:
+            # use the real helper -- it must fall back to a temp copy
+            import sessions as _S
+            _r = _S.ro(_tmpdb)
+            try:
+                _n = _r.execute("select count(*) from t").fetchone()[0]
+                check("safety: a locked db does not kill the run", _n >= 1, f"rows={_n}")
+            except _sq.Error as e:
+                check("safety: a locked db does not kill the run", False, str(e)[:80])
+            finally:
+                _r.close()
+        except _sq.Error as e:
+            check("safety: a locked db does not kill the run", False, str(e)[:80])
+        finally:
+            _w.rollback()
+            _w.close()
+    finally:
+        for _p in (_tmpdb, _tmpdb + "-wal", _tmpdb + "-shm"):
+            if os.path.exists(_p):
+                try:
+                    os.remove(_p)
+                except OSError:
+                    pass
 
     # cross-harness
     check("all --list exits 0", run("all","--list").returncode == 0)

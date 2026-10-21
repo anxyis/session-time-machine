@@ -111,6 +111,27 @@ detect() {
   esac
 }
 
+# Warn if this agent's skills root ends up with two copies of the skill
+# (the agent keys skills by name, so a duplicate is ambiguous).
+_dup_check() {
+  root="$1"
+  [ -d "$root" ] || return 0
+  n=0
+  for d in "$root"/*; do
+    [ -d "$d" ] || continue
+    if [ -d "$d/$SKILL" ] && [ -f "$d/$SKILL/SKILL.md" ]; then
+      n=$((n+1))
+    fi
+  done
+  if [ -f "$root/$SKILL/SKILL.md" ]; then
+    n=$((n+1))
+  fi
+  if [ "$n" -gt 1 ]; then
+    echo "  WARNING: $root now holds $n copies of $SKILL." >&2
+    echo "           Agents key skills by name -- remove the extras." >&2
+  fi
+}
+
 known() {
   for a in "${AGENTS[@]}"; do echo "${a%%|*}"; done
 }
@@ -226,6 +247,7 @@ for t in $TARGETS; do
   rm -rf "$dest"
   mv "$stage_skill" "$dest"
   echo "  installed $dest"
+  _dup_check "$(dirname "$dest")"
   installed=$((installed+1))
 done
 

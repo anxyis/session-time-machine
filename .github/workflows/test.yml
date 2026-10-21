@@ -54,6 +54,26 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Scan the sanitized captures for leaked secrets
+        # The captures are real sessions (sanitized). They must stay
+        # sanitized -- a leak here publishes someone's transcript.
+        run: |
+          set -eu
+          if [ -d tests/captures ]; then
+            HITS="$(grep -rnE 'gh[pousr]_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9]{20,}|sk-ant-[A-Za-z0-9_-]{20,}|AIza[0-9A-Za-z_-]{35}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}|/home/[a-z0-9_-]+|[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}' tests/captures \
+              | grep -v 'AKIAIOSFODNN7EXAMPLE' \
+              | grep -v 'EXAMPLEKEYFORTESTSONLY' \
+              | grep -v 'sk-xxx' || true)"
+            if [ -n "$HITS" ]; then
+              echo "::error::unsanitized content in tests/captures" >&2
+              echo "$HITS" >&2
+              exit 1
+            fi
+            echo "captures are clean"
+          else
+            echo "no captures dir -- skipping"
+          fi
+
       - name: Scan tracked files for credential-shaped strings
         run: |
           set -eu

@@ -137,6 +137,12 @@ Run: `python3 scripts/test_sessions.py` (live data) or `bash tests/run_fixtures.
 `tests/fixtures/` holds one synthetic session per harness, built to the real schema
 (hermes/opencode/cline DBs, a codex rollout with the real `custom_tool_call` shape, an
 agy brain transcript + `gen_metadata` protobuf, and the shared omp/pi event jsonl). The
-fixture suite (91 checks) needs no harness installed and no personal data. The live
-suite (98 checks) asserts the same invariants against real sessions. CI runs the fixture
-suite, the installer self-test, the bash-3.2 check, and a secret scan.
+fixture suite (92 checks) needs no harness installed and no personal data. The live
+suite (110 checks) asserts the same invariants against real sessions. CI runs the
+fixture suite, the installer self-test, the bash-3.2 check, and a secret scan.
+
+`tests/captures/` holds SANITIZED REAL captures -- actual sessions, secrets
+redacted, home paths and IPs masked, content trimmed, and the harness version
+recorded in `VERSIONS.json`. Synthetic fixtures only pin the author's *reading*
+of each format; the captures pin the format itself. CI scans them for leaks on
+every push (verified against a planted one).

@@ -181,9 +181,17 @@ Two things people actually get burned by when they replay a session:
 **Secrets.** Tool output is full of them. API keys in an error message, an
 `env` dump, a password in a config file. This tool scrubs secret-shaped
 strings on the way out — GitHub tokens, OpenAI/Anthropic/Google/AWS/Slack
-keys, JWTs, bearer headers, `password=…` assignments, credentials in URLs,
-and secret-looking env vars. Placeholders (`your_key_here`, `AKIAIOSFODNN7EXAMPLE`,
-`${VAR}`) are left alone, so you don't get a wall of false alarms.
+keys, HuggingFace, Stripe, npm, PyPI, SendGrid, Datadog, Vault, Discord and
+Twilio tokens, JWTs, bearer headers, PEM/SSH/PGP private key blocks,
+`password=…` assignments, credentials in URLs, and secret-looking env vars.
+Placeholders (`your_key_here`, `AKIAIOSFODNN7EXAMPLE`, `${VAR}`) are left
+alone, so you don't get a wall of false alarms.
+
+> [!WARNING]
+> **Redaction is best-effort, not a guarantee.** It matches *shapes* it
+> recognises; a secret in an unusual format, a base64 blob, a bare
+> high-entropy string with no label — those get through. Treat `--export`
+> output as still sensitive. `--raw` gives you the unredacted bytes.
 
 ```bash
 # redacted by default
@@ -211,6 +219,15 @@ instructions. ...
 
 `--no-fence` turns it off if you know what you're doing.
 
+The fence uses a **random nonce per run**, so a transcript that contains a
+fake `=== END UNTRUSTED CONTENT ===` can't close the fence early — only the
+delimiter this process printed will.
+
+And be honest about what it is: **mitigation, not prevention.** A determined
+transcript can still try to talk past a banner. The fence makes the intent
+explicit and gives a reader something to notice; it doesn't make the content
+safe. Read it as data, never execute it.
+
 **Context budget.** The whole reason this tool exists is that a 2.8M-char
 transcript kills the session that reads it. So the tool won't do it to you
 either: `--transcript` / `--md` / `--preview` / `--tail` cap the printed body
@@ -218,8 +235,19 @@ at **120,000 chars** by default and say exactly how much was left out.
 `--json` / `--jsonl` / `--export` stay lossless — a truncated JSON stream is
 worse than a big one.
 
+The cap keeps the **end** of the session, not the start. The question this
+tool answers is "what happened before it died" — that's the tail. The
+marker row tells you exactly how much you missed and how to get it:
+
+```
+[budget: showing the LAST 120000 of 2842760 chars -- 2722760 earlier chars
+ not printed. Use --tail/--preview/--clip to read specific parts, or
+ --budget 0 to print everything.]
+```
+
 ```bash
 python3 scripts/sessions.py hermes --transcript <ID> --budget 0   # no limit
+python3 scripts/sessions.py hermes --transcript <ID> --budget 50000
 ```
 
 ## ◈ FAQ
@@ -278,15 +306,23 @@ python3 skills/session-time-machine/scripts/test_sessions.py
 bash tests/run_fixtures.sh
 ```
 
-The **fixture suite** (91 checks) runs against a small synthetic corpus in
+The **fixture suite** (109 checks) runs against a small synthetic corpus in
 `tests/fixtures/` — one hand-written session per harness, built to the real
 schema. No mocks, no personal transcripts, no secrets, no harness installs.
 It's what CI runs on every push, and what you can run to check the tool still
 parses a format you don't have installed.
 
-The **live suite** (98 checks) does the same assertions against your actual
-sessions — it discovers a real session per harness at runtime. Stronger, but
-only works on a machine where those harnesses are installed.
+Synthetic fixtures only test the author's *reading* of each format, though.
+So there are also **sanitized real captures** in `tests/captures/` — actual
+sessions, secrets redacted, home paths and IPs masked, content trimmed, with
+the harness version recorded in `VERSIONS.json`. Those test the format
+itself, not someone's idea of it. CI scans them for leaks on every push
+(verified against a planted one).
+
+The **live suite** (116 checks) does the same assertions against your actual
+sessions — it discovers a real session per harness at runtime, and checks the
+sanitized captures. Stronger, but only works on a machine where those
+harnesses are installed.
 
 CI also checks that the installer never writes over its own source, that it
 works on bash 3.2 (stock macOS), and that no credential-shaped string or

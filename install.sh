@@ -202,6 +202,8 @@ for t in $TARGETS; do
   # project path that collides with the repo layout (openclaw uses "skills/",
   # which IS the repo's own skills/ dir) -- installing there would delete the
   # source and then try to copy from the deleted source.
+  # Path check, not a name check: refuse if the destination IS the source or
+  # is INSIDE it. A name check would miss the next collision.
   src_abs="$(cd "$SRC" && pwd)"
   dest_parent="$(cd "$(dirname "$dest")" 2>/dev/null && pwd || echo "$PWD/$(dirname "$dest")")"
   dest_abs="$dest_parent/$(basename "$dest")"
@@ -211,6 +213,13 @@ for t in $TARGETS; do
     echo "  use the global path instead:  ./install.sh --agent openclaw" >&2
     exit 1
   fi
+  case "$dest_abs" in
+    "$src_abs"/*)
+      echo "REFUSING: $dest is inside the skill source ($src_abs)." >&2
+      echo "  Installing there would overwrite the source." >&2
+      exit 1
+      ;;
+  esac
 
   if [ "$DRYRUN" = 1 ]; then
     if [ "$UNINSTALL" = 1 ]; then

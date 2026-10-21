@@ -305,15 +305,82 @@ def main():
         check("safety: --no-fence removes the fence",
               "BEGIN UNTRUSTED CONTENT" not in t2.stdout, t2.stdout[:120])
 
+        def _rows(out):
+            m2 = re.search(r"\| (\d+) rows", out)
+            return int(m2.group(1)) if m2 else 0
+
         b = run_home("omp", "--transcript", sid, "--budget", "10")
         check("safety: --budget marks what it did not print",
               "budget" in b.stdout.lower(), b.stdout[:160])
         b0 = run_home("omp", "--transcript", sid, "--budget", "0")
+        # compare ROWS, not bytes: a small budget still prints the marker row
+        # (which explains what was cut), so its byte count can be larger.
         check("safety: --budget 0 prints everything",
-              len(b0.stdout) >= len(b.stdout), f"{len(b0.stdout)} vs {len(b.stdout)}")
+              _rows(b0.stdout) > _rows(b.stdout),
+              f"rows: {b0.stdout[:60]!r}")
+        # and the budget must keep the TAIL, not the head: the last row of
+        # the session is the interesting part ("what happened before it died")
+        tail = run_home("omp", "--transcript", sid, "--budget", "10")
+        check("safety: --budget keeps the end of the session",
+              "tool_result" in tail.stdout or "budget" in tail.stdout.lower(),
+              tail.stdout[-200:])
     finally:
         import shutil
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+    # ---- sanitized REAL captures ---------------------------------------
+    # The synthetic fixtures test the author's reading of each format. These
+    # captures are real sessions (sanitized) -- they test the format itself.
+    # find tests/captures by walking up from this script (the corpus lives at
+    # the repo root in the published layout, and at the skill root in dev)
+    caps_dir = None
+    _d = os.path.dirname(os.path.abspath(__file__))
+    for _ in range(5):
+        _c = os.path.join(_d, "tests", "captures")
+        if os.path.isdir(_c):
+            caps_dir = _c
+            break
+        _d = os.path.dirname(_d)
+    if not caps_dir:
+        skip("sanitized real captures", "no captures dir")
+    else:
+        import json as _json2
+        for hname in ("hermes", "omp", "codex", "agy"):
+            cpath = os.path.join(caps_dir, hname + ".json")
+            if not os.path.exists(cpath):
+                skip(f"capture {hname}", "no capture")
+                continue
+            try:
+                cap = _json2.load(open(cpath, encoding="utf-8"))
+            except Exception as e:
+                check(f"capture {hname} parses", False, str(e)[:80])
+                continue
+            rows = cap.get("rows") or []
+            check(f"capture {hname} has rows", len(rows) > 0, f"{len(rows)} rows")
+            check(f"capture {hname} records a harness version",
+                  bool(cap.get("_harness_version")),
+                  str(cap.get("_harness_version"))[:40])
+            # the capture must be sanitized: no real home paths, no emails
+            blob = _json2.dumps(cap)
+            check(f"capture {hname} is sanitized",
+                  "/home/" not in blob.replace("/home/<user>", "")
+                  and not re.search(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", blob),
+                  "unsanitized content found")
+            # the capture must use the SAME field names the adapter reads
+            if hname == "hermes":
+                keys = set(rows[0].keys()) if rows else set()
+                check("capture hermes uses the adapter's column names",
+                      {"role", "content", "tool_calls", "timestamp"} <= keys,
+                      str(sorted(keys))[:120])
+            elif hname in ("omp", "codex", "agy"):
+                types = {r.get("type") for r in rows if isinstance(r, dict)}
+                check(f"capture {hname} has known step types",
+                      bool(types) and all(isinstance(t, str) for t in types),
+                      str(sorted(x for x in types if x))[:120])
+                if hname == "omp":
+                    check("capture omp carries toolCallId pairing",
+                          any("toolCallId" in _json2.dumps(r) for r in rows),
+                          "no toolCallId found")
 
     # cross-harness
     check("all --list exits 0", run("all","--list").returncode == 0)

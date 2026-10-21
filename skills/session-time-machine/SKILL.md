@@ -17,7 +17,7 @@ python3 $S hermes --peek <ID>                 # size + fidelity before loading
 python3 $S hermes --jsonl <ID> | head -40     # chunkable, content=null where lost
 python3 $S hermes --md <ID>                   # full, for read_file(offset=N)
 ```
-Tests: `python3 scripts/test_sessions.py` → **98/98 green** (live) · **91/91** (fixture corpus, `tests/run_fixtures.sh`), all against live databases (no mocks). Re-run after any harness change.
+Tests: `python3 scripts/test_sessions.py` → **116/116 green** (live) · **91/91** (fixture corpus, `tests/run_fixtures.sh`), all against live databases (no mocks). Re-run after any harness change.
 
 ## Normalized row (one shape for every harness)
 ```
@@ -137,8 +137,8 @@ Run: `python3 scripts/test_sessions.py` (live data) or `bash tests/run_fixtures.
 `tests/fixtures/` holds one synthetic session per harness, built to the real schema
 (hermes/opencode/cline DBs, a codex rollout with the real `custom_tool_call` shape, an
 agy brain transcript + `gen_metadata` protobuf, and the shared omp/pi event jsonl). The
-fixture suite (92 checks) needs no harness installed and no personal data. The live
-suite (110 checks) asserts the same invariants against real sessions. CI runs the
+fixture suite (109 checks) needs no harness installed and no personal data. The live
+suite (116 checks) asserts the same invariants against real sessions. CI runs the
 fixture suite, the installer self-test, the bash-3.2 check, and a secret scan.
 
 `tests/captures/` holds SANITIZED REAL captures -- actual sessions, secrets

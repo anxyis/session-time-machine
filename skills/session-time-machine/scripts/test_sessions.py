@@ -14,7 +14,7 @@ def check(name, cond, detail=""):
     global P,F
     if cond: P+=1; print(f"  PASS  {name}")
     else: F+=1; print(f"  FAIL  {name}  ({detail})")
-def skip(name, reason): global P;F+=0; print(f"  SKIP  {name}  ({reason})")
+def skip(name, reason): global P; print(f"  SKIP  {name}  ({reason})")
 def jget(harness, sid, *parts):
     o = run(harness, "--json", sid, *parts)
     return _safe_json(o.stdout)
@@ -208,6 +208,39 @@ def main():
         check("agy tool_output count matches tool_call count",
               len(to) >= ncall * 0.9,
               f"tool_output={len(to)} tool_call={ncall}")
+    # omp / pi (oh-my-pi + pi share the session format)
+    for harness in ("omp", "pi"):
+        o = jget(harness, first_sid(harness)[0] or "")
+        if not o.get("messages"):
+            skip(f"{harness} (no sessions on this box)", "not installed")
+            continue
+        om = o["messages"]
+        otool = [x for x in om if x["kind"] == "tool_output"]
+        ocall = [x for x in om if x["kind"] == "tool_call"]
+        check(f"{harness} tool_output rows use role=tool",
+              bool(otool) and all(x["role"] == "tool" for x in otool),
+              str(Counter(x["role"] for x in otool)))
+        check(f"{harness} tool_output count matches tool_call count",
+              len(otool) == len(ocall) and len(ocall) > 0,
+              f"tool_output={len(otool)} tool_call={len(ocall)}")
+        # every tool_call id must be answered by a tool_output with the same id
+        callids = {x.get("tool_call_id") for x in ocall if x.get("tool_call_id")}
+        outids = {x.get("tool_call_id") for x in otool if x.get("tool_call_id")}
+        check(f"{harness} tool calls pair with results by call id",
+              bool(callids) and callids == outids,
+              f"{len(callids - outids)} unmatched")
+        # tool_call rows must carry the tool arguments (not just the name)
+        withargs = [x for x in ocall if x.get("content")]
+        check(f"{harness} tool_call args preserved",
+              bool(withargs) and len(withargs) >= len(ocall) * 0.9,
+              f"{len(withargs)}/{len(ocall)} carry args")
+        check(f"{harness} thinking is reasoning, not message",
+              any(x["kind"] == "reasoning" for x in om),
+              str(Counter(x["kind"] for x in om)))
+        # fidelity must be reported, never assumed
+        check(f"{harness} fidelity reported",
+              "complete" in o.get("session", {}).get("fidelity", {}),
+              str(o.get("session", {}).get("fidelity", {}))[:120])
     # cross-harness
     check("all --list exits 0", run("all","--list").returncode == 0)
     check("all --search exits 0", run("all","--search","the").returncode == 0)

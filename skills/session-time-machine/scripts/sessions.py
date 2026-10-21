@@ -13,8 +13,8 @@ with zero schema reasoning and zero hallucination. Hard rules:
   * All timestamps are converted to IST here. Hermes=epoch s, OpenCode=epoch ms.
   * Tool-call steps and reasoning are tagged, never rendered as a reply.
 
-Harnesses: hermes, opencode, cline, codex, agy. Every harness feeds the SAME
-row shape, so filtering/search/export/printing are shared, not re-implemented.
+Harnesses: hermes, opencode, cline, codex, agy, omp, pi. Every harness feeds the
+SAME row shape, so filtering/search/export/printing are shared, not re-implemented.
 
 Usage:
   sessions.py <harness|all> --list [N] [--since DAYS] [--until DAYS] [--source X]
@@ -45,7 +45,7 @@ CLINE_SESSION_DIR = os.path.expanduser("~/.cline/data/sessions")
 CODEX_SESSION_DIR = os.path.expanduser("~/.codex/sessions")
 AGY_DIR = os.path.expanduser("~/.gemini/antigravity-cli/conversations")
 
-HARNESSES = ["hermes", "opencode", "cline", "codex", "agy"]
+HARNESSES = ["hermes", "opencode", "cline", "codex", "agy", "omp", "pi"]
 
 def ro(path):
     """Open a sqlite DB strictly read-only via URI. Raises FileNotFoundError if absent."""
@@ -321,6 +321,8 @@ def print_jsonl(rows, sid, harness, c):
             "content": r["content"], "content_chars": len(r["content"] or ""),
             "reasoning_chars": len(r["reasoning"]) if r["reasoning"] else None,
             "tool_names": r["tool_names"] or None, "is_error": r["is_error"],
+            "tool_call_id": r.get("tool_call_id"),
+            "sub": r.get("sub") or None,
             "attachments": r["attachments"] or None,
             "unrecovered": r["unrecovered"] or None}, ensure_ascii=False))
 
@@ -341,6 +343,8 @@ def _json_msg(r):
             "tag": kind_tag(r), "content": r["content"],
             "reasoning_chars": len(r["reasoning"]) if r["reasoning"] else None,
             "tool_names": r["tool_names"] or None, "is_error": r["is_error"],
+            "tool_call_id": r.get("tool_call_id"),
+            "sub": r.get("sub") or None,
             "attachments": r["attachments"] or None,
             "unrecovered": r["unrecovered"] or None}
 
@@ -1315,6 +1319,489 @@ def _agy_rows(sid):
         return _agy_rows_from_transcript(sid, res[0], res[1], tp)
     # fallback: protobuf DB
     return _agy_rows_from_db(sid)
+# ---------- omp/pi adapter ----------
+# Pi (badlogic/pi-mono) and OMP (can1357/oh-my-pi) share a session
+# format: an event-sourced JSONL per session under
+#   ~/.omp/agent/sessions/<project>/<ISOts>_<uuid>.jsonl   (OMP)
+#   ~/.pi/agent/sessions/<project>/<ISOts>_<uuid>.jsonl    (Pi)
+# Every line is an event; ids form a parentId chain. Tool calls live
+# in assistant message content parts, tool results in a separate
+# role=toolResult message that carries the same toolCallId.
+#!/usr/bin/env python3
+"""OMP / Pi session adapter (shared format, two roots).
+
+Pi (github.com/badlogic/pi-mono, now earendil-works/pi) and OMP
+(github.com/can1357/oh-my-pi, a fork of Pi) store sessions the same way:
+
+    ~/.omp/agent/sessions/<project-slug>/<ISOts>_<uuid>.jsonl
+    ~/.pi/agent/sessions/<project-slug>/<ISOts>_<uuid>.jsonl
+
+Each file is an event-sourced JSONL: every line is an event with an `id` and
+a `parentId` forming a linked list. Event types seen in the wild:
+
+    title                  session title (one per file, first line)
+    session                session header: id, cwd, version, previousSessionFiles
+    message                role=user|assistant|toolResult, content=[parts]
+    custom                 customType=tool_execution_start, session_exit, ...
+    custom_message         customType=async-result, todo-error-reminder, ...
+    model_change           the active model changed
+    model_usage            per-call token + cost accounting
+    title_change           the session was retitled
+    thinking_level_change  thinking level changed
+    service_tier_change    service tier changed
+
+Content parts inside a `message`:
+    text       {"type":"text","text":...}
+    thinking   {"type":"thinking","thinking":...,"thinkingSignature":...}
+    toolCall   {"type":"toolCall","id":"call_...","name":...,"arguments":{...}}
+    image      {"type":"image",...}
+
+A tool result arrives as a *message* with role="toolResult" carrying
+`toolCallId` + `toolName` -- the same id the toolCall part used, so calls and
+results pair exactly. `isError` marks failures.
+"""
+
+import glob
+import json
+import os
+import re
+import time
+
+# OMP and Pi share the layout; only the root differs.
+_OMP_ROOTS = [
+    ("omp", os.path.expanduser("~/.omp/agent/sessions")),
+    ("pi", os.path.expanduser("~/.pi/agent/sessions")),
+]
+
+# "<ISO-timestamp>_<uuid>.jsonl" -- the timestamp is the session start.
+_OMP_SID_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}T[\d:.-]+Z)_([0-9a-f-]{36})\.jsonl$", re.I)
+
+
+def _omp_iter_session_files(root):
+    """Yield (project_slug, path) for every session jsonl under a root."""
+    if not os.path.isdir(root):
+        return
+    for proj in sorted(glob.glob(os.path.join(root, "*"))):
+        if not os.path.isdir(proj):
+            continue
+        slug = os.path.basename(proj)
+        for path in sorted(glob.glob(os.path.join(proj, "*.jsonl"))):
+            yield slug, path
+
+
+def _omp_session_id(path):
+    """Session id = '<ISOts>_<uuid>' from the filename, else the file stem."""
+    base = os.path.basename(path)
+    m = _OMP_SID_RE.match(base)
+    if m:
+        return f"{m.group(1)}_{m.group(2)}"
+    return base[:-6] if base.endswith(".jsonl") else base
+
+
+def _omp_ts_to_epoch(ts):
+    """ISO8601 (Z) -> epoch seconds. Returns None on anything unparseable."""
+    if not ts:
+        return None
+    if isinstance(ts, (int, float)):
+        # pi/omp write message timestamps as epoch MILLISECONDS
+        return ts / 1000.0 if ts > 1e11 else float(ts)
+    t = str(ts).strip()
+    if t.endswith("Z"):
+        t = t[:-1] + "+00:00"
+    try:
+        import datetime
+        return datetime.datetime.fromisoformat(t).timestamp()
+    except Exception:
+        return None
+
+
+def _omp_read_events(path):
+    """Parse a session jsonl into a list of (line_no, event). Bad lines are
+    reported, never silently dropped."""
+    events = []
+    bad = []
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        for i, line in enumerate(fh):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except Exception:
+                bad.append(f"line {i + 1}: not valid JSON")
+                continue
+            if not isinstance(obj, dict):
+                bad.append(f"line {i + 1}: not a JSON object")
+                continue
+            events.append((i, obj))
+    return events, bad
+
+
+def _omp_parts_text(parts):
+    """Concatenate the text of a content-part list."""
+    out = []
+    for p in parts or []:
+        if not isinstance(p, dict):
+            continue
+        if p.get("type") == "text" and p.get("text"):
+            out.append(p["text"])
+    return "\n".join(out)
+
+
+def _omp_parts_images(parts):
+    """Attachment descriptors for image parts (bytes are not decoded)."""
+    atts = []
+    for p in parts or []:
+        if not isinstance(p, dict):
+            continue
+        if p.get("type") == "image":
+            atts.append({"kind": "image", "mime": p.get("mimeType") or p.get("mime"),
+                         "meta": {k: v for k, v in p.items()
+                                  if k in ("width", "height", "path", "url")}})
+    return atts
+
+
+def _omp_first_user(events):
+    for _, ev in events:
+        if ev.get("type") == "message" and (ev.get("message") or {}).get("role") == "user":
+            return _omp_parts_text((ev["message"].get("content") or []))
+    return ""
+
+
+def _omp_title_of(events):
+    for _, ev in events:
+        if ev.get("type") == "title" and ev.get("title"):
+            return ev["title"]
+    for _, ev in events:
+        if ev.get("type") == "title_change" and ev.get("title"):
+            return ev["title"]
+    return ""
+
+
+def _omp_model_of(events):
+    """Last model_change wins (the active model at end of session)."""
+    model = None
+    provider = None
+    for _, ev in events:
+        if ev.get("type") == "model_change":
+            if ev.get("model"):
+                model = ev["model"]
+            if ev.get("provider"):
+                provider = ev["provider"]
+    if model:
+        return model, provider
+    for _, ev in events:
+        if ev.get("type") == "model_usage" and ev.get("model"):
+            return ev["model"], ev.get("provider")
+    return model, provider
+
+
+def _omp_usage_of(events):
+    """Sum model_usage rows into a session-level usage dict.
+
+    These totals are session-level (like every other harness's usage block) and
+    are never summed into transcript rows.
+    """
+    agg = {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0,
+           "totalTokens": 0, "cost": 0.0, "calls": 0}
+    for _, ev in events:
+        if ev.get("type") != "model_usage":
+            continue
+        u = ev.get("usage") or {}
+        for k in ("input", "output", "cacheRead", "cacheWrite", "totalTokens"):
+            if isinstance(u.get(k), (int, float)):
+                agg[k] += u[k]
+        c = u.get("cost") or {}
+        if isinstance(c.get("total"), (int, float)):
+            agg["cost"] += c["total"]
+        agg["calls"] += 1
+    if not agg["calls"]:
+        return None
+    agg["cost"] = round(agg["cost"], 8)
+    return agg
+
+
+def _omp_cwd_of(events):
+    for _, ev in events:
+        if ev.get("type") == "session" and ev.get("cwd"):
+            return ev["cwd"]
+    return ""
+
+
+def _omp_list_sessions(root, limit=None):
+    """[(sid, path, mtime, size, slug)] newest first."""
+    out = []
+    for slug, path in _omp_iter_session_files(root):
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        out.append((_omp_session_id(path), path, st.st_mtime, st.st_size, slug))
+    out.sort(key=lambda x: x[2], reverse=True)
+    return out[:limit] if limit else out
+
+
+def _omp_rows_for(path, sid, harness):
+    """Normalized rows for one session file.
+
+    Row kinds map onto the shared shape:
+        user text            -> role=user      kind=message
+        assistant text       -> role=assistant kind=message
+        assistant thinking   -> role=assistant kind=reasoning
+        toolCall part        -> role=assistant kind=tool_call
+        toolResult message   -> role=tool      kind=tool_output
+        custom/system events -> role=system    kind=lifecycle
+    """
+    events, bad = _omp_read_events(path)
+    rows = []
+    unrec = list(bad)
+    model, provider = _omp_model_of(events)
+    pending = {}          # toolCall id -> tool name, for result pairing
+    seq = 0
+    # The session header carries the authoritative start time. The title event
+    # carries `updatedAt` (when it was last renamed), which can be much later
+    # than the session start -- so stamp the title with the session start.
+    session_start = None
+    for _, ev in events:
+        if ev.get("type") == "session":
+            session_start = _omp_ts_to_epoch(ev.get("timestamp"))
+            break
+
+    def R(role, kind, content=None, **kw):
+        sub = kw.pop("sub", harness)
+        ts = kw.pop("ts", None)
+        ep = kw.pop("epoch", None)
+        return {
+            "harness": harness, "sid": sid, "seq": seq, "role": role,
+            "epoch": ep, "ts": ts, "kind": kind,
+            "content": content if content else None,
+            "reasoning": kw.pop("reasoning", None) or None,
+            "tool_names": kw.pop("tool_names", []) or [],
+            "tool_call_id": kw.pop("tool_call_id", None),
+            "model": kw.pop("model", model), "provider": kw.pop("provider", provider),
+            "is_error": bool(kw.pop("is_error", False)),
+            "attachments": kw.pop("attachments", []) or [],
+            "unrecovered": [], "sub": sub, "_display": None, "tags": [],
+        }
+
+    def stamp(ev):
+        """(iso ts, epoch) for an event -- event timestamp wins, then the
+        message's own timestamp, then updatedAt (title events use that)."""
+        raw = ev.get("timestamp")
+        if raw is None:
+            raw = (ev.get("message") or {}).get("timestamp")
+        if raw is None:
+            raw = ev.get("updatedAt")
+        ep = _omp_ts_to_epoch(raw)
+        if ep is None:
+            return "", None
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ep)), ep
+
+    for _, ev in events:
+        etype = ev.get("type")
+        ts, ep = stamp(ev)
+
+        if etype == "message":
+            msg = ev.get("message") or {}
+            role = msg.get("role")
+            parts = msg.get("content") or []
+            if role == "user":
+                seq += 1
+                text = _omp_parts_text(parts)
+                rows.append(R("user", "message", content=text or None, ts=ts, epoch=ep,
+                              attachments=_omp_parts_images(parts),
+                              sub="user message"))
+            elif role == "assistant":
+                for p in parts:
+                    if not isinstance(p, dict):
+                        continue
+                    ptype = p.get("type")
+                    if ptype == "thinking":
+                        seq += 1
+                        rows.append(R("assistant", "reasoning",
+                                      reasoning=p.get("thinking") or "",
+                                      ts=ts, epoch=ep,
+                                      sub=f"thinking ({len(p.get('thinking') or '')}c)"))
+                    elif ptype == "toolCall":
+                        seq += 1
+                        args = p.get("arguments")
+                        rows.append(R("assistant", "tool_call",
+                                      content=json.dumps(args, ensure_ascii=False)
+                                      if args is not None else None,
+                                      tool_names=[p.get("name")] if p.get("name") else [],
+                                      tool_call_id=p.get("id"),
+                                      ts=ts, epoch=ep,
+                                      sub=f"tool_call: {p.get('name')}"))
+                        if p.get("id"):
+                            pending[p["id"]] = p.get("name")
+                    elif ptype == "text":
+                        seq += 1
+                        rows.append(R("assistant", "message", content=p.get("text") or None,
+                                      ts=ts, epoch=ep, sub="assistant message"))
+                    elif ptype == "image":
+                        seq += 1
+                        rows.append(R("assistant", "message", content=None, ts=ts, epoch=ep,
+                                      attachments=_omp_parts_images([p]),
+                                      sub="assistant image"))
+            elif role == "toolResult":
+                seq += 1
+                call_id = msg.get("toolCallId")
+                tname = msg.get("toolName") or pending.get(call_id)
+                iserr = bool(msg.get("isError"))
+                text = _omp_parts_text(parts)
+                rows.append(R("tool", "tool_output", content=text or None, ts=ts, epoch=ep,
+                              tool_names=[tname] if tname else [],
+                              tool_call_id=call_id, is_error=iserr,
+                              sub=f"tool_result: {tname or '?'}"
+                                  + (" (error)" if iserr else "")))
+                if call_id:
+                    pending.pop(call_id, None)
+            else:
+                seq += 1
+                rows.append(R("system", "lifecycle", content=None, ts=ts, epoch=ep,
+                              sub=f"message role={role} (unmapped)"))
+
+        elif etype == "custom":
+            # tool_execution_start duplicates the toolCall args with an intent
+            # label; the call itself is already emitted from the message part.
+            ctype = ev.get("customType")
+            data = ev.get("data") or {}
+            if ctype == "tool_execution_start":
+                seq += 1
+                rows.append(R("system", "lifecycle", content=None, ts=ts, epoch=ep,
+                              sub=f"tool_execution_start: {data.get('toolName')}"
+                                  + (f" ({data.get('intent')})" if data.get("intent") else "")))
+            else:
+                seq += 1
+                rows.append(R("system", "lifecycle", content=None, ts=ts, epoch=ep,
+                              sub=f"custom: {ctype}"))
+
+        elif etype == "custom_message":
+            ctype = ev.get("customType")
+            seq += 1
+            rows.append(R("developer", "message", content=ev.get("content") or None,
+                          ts=ts, epoch=ep, sub=f"custom_message: {ctype}"))
+
+        elif etype in ("title", "title_change"):
+            seq += 1
+            ts, ep = (time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(session_start)),
+                      session_start) if session_start else (ts, ep)
+            rows.append(R("system", "lifecycle", content=ev.get("title") or None,
+                          ts=ts, epoch=ep, sub=f"{etype}"))
+
+        elif etype == "session":
+            seq += 1
+            rows.append(R("system", "lifecycle", content=ev.get("cwd") or None,
+                          ts=ts, epoch=ep, sub="session header"))
+
+        elif etype in ("model_change", "model_usage", "thinking_level_change",
+                       "service_tier_change"):
+            seq += 1
+            rows.append(R("system", "lifecycle", content=None, ts=ts, epoch=ep,
+                          sub=etype))
+
+        else:
+            seq += 1
+            unrec.append(f"event {etype!r}: unknown event type")
+            rows.append(R("system", "lifecycle", content=None, ts=ts, epoch=ep,
+                          sub=f"{etype} (unknown)"))
+
+    # A tool call with no result is a real gap, not a formatting detail.
+    for call_id, name in pending.items():
+        unrec.append(f"tool call {name or '?'} ({call_id}) has no result")
+
+    if rows and unrec:
+        rows[0]["unrecovered"] = list(unrec)
+    return rows, unrec
+
+
+def omp_find_session(sid):
+    """Locate a session file by id across both roots. Returns
+    (harness, path) or (None, None)."""
+    for harness, root in _OMP_ROOTS:
+        for _, path in _omp_iter_session_files(root):
+            if _omp_session_id(path) == sid:
+                return harness, path
+    # allow a full path or a unique suffix
+    if os.path.isfile(sid):
+        return ("omp" if "/.omp/" in sid else "pi"), sid
+    for harness, root in _OMP_ROOTS:
+        for _, path in _omp_iter_session_files(root):
+            if os.path.basename(path).startswith(sid):
+                return harness, path
+    return None, None
+
+
+def omp_load(sid):
+    """Normalized rows + info for a session id."""
+    harness, path = omp_find_session(sid)
+    if not path:
+        return [], {"harness": "omp", "source": sid,
+                    "note": "NOT FOUND (no session jsonl for this id)"}
+    rows, unrec = _omp_rows_for(path, _omp_session_id(path), harness)
+    events, _ = _omp_read_events(path)
+    info = {
+        "harness": harness, "source": path,
+        "model": _omp_model_of(events)[0], "provider": _omp_model_of(events)[1],
+        "usage": _omp_usage_of(events),
+        "note": "session jsonl (event-sourced, parentId chain): messages, tool "
+                "calls/results, thinking, model changes and token usage recovered",
+    }
+    if rows:
+        info["start"] = rows[0]["ts"]
+        info["end"] = rows[-1]["ts"]
+    if unrec:
+        info["unrecovered"] = unrec
+    return rows, info
+
+
+def omp_list_sessions(harness=None, limit=None):
+    """Recent sessions. harness=None scans both roots."""
+    out = []
+    roots = _OMP_ROOTS if harness is None else [r for r in _OMP_ROOTS if r[0] == harness]
+    for h, root in roots:
+        for sid, path, mtime, size, slug in _omp_list_sessions(root, None):
+            out.append((mtime, sid, path, h, size, slug))
+    out.sort(key=lambda x: x[0], reverse=True)
+    return out[:limit] if limit else out
+
+
+def omp_search(term, harness=None):
+    """Full-text omp_search over session files. Yields (sid, harness, path, line_no, text)."""
+    needles = [t for t in term.lower().split() if t]
+    if not needles:
+        return
+    roots = _OMP_ROOTS if harness is None else [r for r in _OMP_ROOTS if r[0] == harness]
+    for h, root in roots:
+        for sid, path, _mt, _sz, _slug in _omp_list_sessions(root, None):
+            try:
+                with open(path, encoding="utf-8", errors="replace") as fh:
+                    for i, line in enumerate(fh):
+                        low = line.lower()
+                        if all(n in low for n in needles):
+                            yield sid, h, path, i + 1, line.strip()[:400]
+            except OSError:
+                continue
+
+
+
+def omp_print_list(n, harness=None):
+    """Print recent omp/pi sessions in the shared list format."""
+    entries = omp_list_sessions(harness, None)
+    entries = entries[:n] if n else entries
+    print(f"## {harness or 'omp/pi'} sessions ({len(entries)} shown)")
+    for mtime, sid, path, h, size, slug in entries:
+        ts = time.strftime("%Y-%m-%d %H:%M IST", time.localtime(mtime))
+        print(f"{sid} | {h} | {ts} | {size}B | {slug} | @session:{h}/{sid}")
+
+
+def omp_print_search(term, harness=None):
+    """Full-text omp_search over omp/pi session files."""
+    hits = list(omp_search(term, harness))
+    print(f"## -- omp_search {term!r} in {harness or 'omp/pi'} -- {len(hits)} hit(s)")
+    for sid, h, path, line, text in hits[:50]:
+        print(f"{sid} | {h} | {os.path.basename(path)}:{line} | {text[:200]}")
+
 # ---------- dispatch + argparse + entry point ----------
 # NOTE: the harness positional is dest="harness" (NOT a "tool" attribute) so it
 # never collides with the --tool content filter.
@@ -1329,6 +1816,7 @@ def _get_rows(tool, sid):
     elif tool == "cline": rows, info = _cline_rows(sid)
     elif tool == "codex": rows, info = _codex_rows(sid)
     elif tool == "agy": rows, info = _agy_rows(sid)
+    elif tool in ("omp", "pi"): rows, info = omp_load(sid)
     else: rows, info = [], {}
     return rows, info
 
@@ -1405,7 +1893,7 @@ def _export(rows, sid, tool, a, c, info=None):
 
 def _do_search(tool, term, filt):
     if tool == "all":
-        for h in ("hermes", "opencode", "cline", "codex", "agy"):
+        for h in HARNESSES:
             print(f"## -- search {term!r} in {h} --")
             try: _do_search(h, term, filt)
             except Exception as e: _notice(f"(search in {h} failed: {e})")
@@ -1416,6 +1904,7 @@ def _do_search(tool, term, filt):
     elif tool == "cline": cline_search(term)
     elif tool == "codex": codex_search(term)
     elif tool == "agy": agy_search(term)
+    elif tool in ("omp", "pi"): omp_print_search(term, tool)
 
 def _do_list(tool, n, a):
     if tool == "all":
@@ -1431,6 +1920,7 @@ def _do_list(tool, n, a):
     elif tool == "cline": cline_list(n)
     elif tool == "codex": codex_list(n)
     elif tool == "agy": agy_list(n)
+    elif tool in ("omp", "pi"): omp_print_list(n, tool)
 
 def main():
     ap = argparse.ArgumentParser(description="Universal AI conversation inspector.")

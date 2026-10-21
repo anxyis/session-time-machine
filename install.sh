@@ -33,6 +33,13 @@ AGENTS=(
   "windsurf|.windsurf/skills|$HOME/.codeium/windsurf/skills"
   "zed|.agents/skills|$HOME/.agents/skills"
   "warp|.agents/skills|$HOME/.warp/skills"
+  # Pi (earendil-works/pi) and OMP (can1357/oh-my-pi) both load user-level
+  # skills from ~/.agents/skills -- verified in the pi-coding-agent dist
+  # (getHomeDir()/.agents/skills) and in the omp binary's own loader strings
+  # ("Load skills from .agent/skills and .agents/skills (project walk-up + user
+  # home)"). ~/.pi/agent and ~/.omp/agent hold their own config, not skills.
+  "pi|.agents/skills|$HOME/.agents/skills"
+  "omp|.agents/skills|$HOME/.agents/skills"
 )
 
 usage() {
@@ -95,6 +102,8 @@ detect() {
     windsurf)        [ -d "$HOME/.codeium" ] ;;
     zed)             [ -d "$HOME/.agents" ] ;;
     warp)            [ -d "$HOME/.warp" ] ;;
+    pi)              [ -d "$HOME/.pi" ] ;;
+    omp)             [ -d "$HOME/.omp" ] ;;
     *) return 1 ;;
   esac
 }
@@ -137,11 +146,19 @@ else
 fi
 
 installed=0
+declare -A SEEN_DEST=()
 for t in "${TARGETS[@]}"; do
   entry="$(for a in "${AGENTS[@]}"; do [ "${a%%|*}" = "$t" ] && { echo "$a"; break; }; done)"
   proj="${entry#*|}"; proj="${proj%%|*}"; glob="${entry##*|}"
   base="$([ "$PROJECT" = 1 ] && echo "$proj" || echo "$glob")"
   dest="$base/$SKILL"
+  # several agents can share one directory (pi/omp/zed all use .agents/skills)
+  # -- install once, then just record the alias
+  if [ -n "${SEEN_DEST[$dest]:-}" ]; then
+    echo "installed $dest (shared with ${SEEN_DEST[$dest]})"
+    continue
+  fi
+  SEEN_DEST[$dest]="$t"
 
   if [ "$UNINSTALL" = 1 ]; then
     if [ -d "$dest" ]; then

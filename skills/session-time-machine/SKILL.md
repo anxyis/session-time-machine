@@ -1,6 +1,6 @@
 ---
 name: session-time-machine
-description: Use when digging through past agent sessions and conversation transcripts across harnesses (Hermes, OpenCode, Cline, Codex, Antigravity).
+description: Use when digging through past agent sessions and conversation transcripts across harnesses (Hermes, OpenCode, Cline, Codex, Antigravity, Omp, Pi).
 ---
 
 # Session Time Machine
@@ -17,7 +17,7 @@ python3 $S hermes --peek <ID>                 # size + fidelity before loading
 python3 $S hermes --jsonl <ID> | head -40     # chunkable, content=null where lost
 python3 $S hermes --md <ID>                   # full, for read_file(offset=N)
 ```
-Tests: `python3 scripts/test_sessions.py` → **85/85 green**, all against live databases (no mocks). Re-run after any harness change.
+Tests: `python3 scripts/test_sessions.py` → **91/91 green**, all against live databases (no mocks). Re-run after any harness change.
 
 ## Normalized row (one shape for every harness)
 ```
@@ -67,21 +67,22 @@ Filters SELECT rows only — they never mutate a row, so a surviving row is iden
 ```
 Date filters use `epoch`, normalized per harness (Hermes seconds, OpenCode milliseconds, Codex/session_meta timestamps, Agy step idx→file mtime). `--no-tools` and `--include-lifecycle` are honored on **every** output path (transcript/tail/preview/md/jsonl/json/export). `--peek` always reports the full counts (it is a summary, not a transcript).
 
-## Harness coverage (verified 2026-10-21)
-| Capability | Hermes | OpenCode | Cline | Codex | Agy |
-|---|---|---|---|---|---|
-| list / peek | ✅ | ✅ | ✅ | ✅ | ✅ (+ `--logs`) |
-| complete transcript | ✅ | ✅ | ✅ | ✅ | ✅ (plaintext `transcript_full.jsonl`) |
-| `--no-tools`, `--role`, `--model`, `--errors` | ✅ | ✅ | ✅ | ✅ | ✅ |
-| search | ✅ (content+tool_calls) | ✅ (`part.text`) | ✅ | ✅ (rollout text) | ✅ (plaintext transcript) |
-| export md/jsonl/json/txt | ✅ | ✅ | ✅ | ✅ | ✅ |
-| fidelity report | ✅ | ✅ | ✅ | ✅ | ✅ |
+## Harness coverage (verified 2026-10-22)
+| Capability | Hermes | OpenCode | Cline | Codex | Agy | Omp | Pi |
+|---|---|---|---|---|---|---|---|
+| list / peek | ✅ | ✅ | ✅ | ✅ | ✅ (+ `--logs`) | ✅ | ✅ |
+| complete transcript | ✅ | ✅ | ✅ | ✅ | ✅ (plaintext `transcript_full.jsonl`) | ✅ (event-sourced jsonl) | ✅ (same format) |
+| `--no-tools`, `--role`, `--model`, `--errors` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| search | ✅ (content+tool_calls) | ✅ (`part.text`) | ✅ | ✅ (rollout text) | ✅ (plaintext transcript) | ✅ (raw line scan) | ✅ (same) |
+| export md/jsonl/json/txt | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| fidelity report | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 
 - **Hermes** — `~/.hermes/state.db` (epoch **seconds**). `api_content` recovered for interrupted responses (tagged `[empty: … response interrupted …]`); never fabricated.
 - **OpenCode** — `~/.local/share/opencode/opencode.db` (epoch **ms**). Reimplemented as a normalized row stream (was text-only `--tail`); `--search` now queries the `part` table (`json_extract(data,'$.text')`), which the prior version searched `message.data` (metadata-only → always empty). Model parsed from `session.model` JSON.
 - **Cline** — `~/.cline/data/db/sessions.db`; each session's transcript lives in an external JSON file referenced by `messages_path`. Three recoveries: (1) `tool_result.content` (a JSON **list** of blocks) is flattened by a recursive block extractor — a prior `_block_texts` called itself on a single block dict (it only handled lists) and silently dropped every structured result; (2) tool results — Cline stores them as `role:"user"` `tool_result` blocks — are emitted as `tool_output` rows paired to their call via `tool_use_id` (previously misfiled as empty user messages); (3) per-turn `thinking` blocks are emitted as `reasoning` rows (a `think` char-count was computed then discarded) and `tool_use.input` is carried on the `tool_call` row so argument values survive.
 - **Codex** — `~/.codex/sessions/*/*/rollout-*.jsonl` (Responses-API). `world_state`/`turn_context` emitted as `[lifecycle]` (hidden by default) — no longer leak as fake `[ok]` assistant messages. Session id taken from the rollout filename.
 | **Agy** — Antigravity CLI keeps a plaintext, structured `brain/<convId>/.system_generated/logs/transcript_full.jsonl` (one JSON step per line: `type`/`source`/`status`, `content`, `tool_calls[{name,args}]`, `thinking`, RFC3339 `created_at`). This is the **primary** source and yields `fidelity.complete:true` (lossless: tool calls/args, thinking, status, timestamps all recovered). The per-conversation SQLite `gen_metadata` protobuf is decoded **only for metadata** — field 1→field 19 = `model_id`, and usage fields 1→4→{2 uncached-input, 3 output-incl-thinking, 5 cache-read} — reported as a session-level `session.usage` dict (these totals are not summed into the transcript rows and are clearly labeled). Per-generation blobs that fail the plausibility gate (missing input/output fields) are counted out, never summed, and surfaced as `session.usage.gen_skipped` so nothing is silently lost. The DB `step_payload` protobuf is a **fallback** only when a brain transcript is absent (then `fidelity.complete:false`), disclosed as protobuf-string-extracted, never schema-decoded.
+- **Omp / Pi** — [Pi](https://github.com/earendil-works/pi) (badlogic/pi-mono) and [OMP](https://github.com/can1357/oh-my-pi) (a fork of Pi) share a session format: `~/.omp/agent/sessions/<project>/<ISOts>_<uuid>.jsonl` (OMP) and `~/.pi/agent/sessions/<project>/<ISOts>_<uuid>.jsonl` (Pi). The file is **event-sourced** — every line is an event with `id`/`parentId`. `message` events carry `role=user|assistant|toolResult` and a `content` list of parts (`text`/`thinking`/`toolCall`/`image`). A tool result is a *separate* `role=toolResult` message carrying the same `toolCallId` as the call, so calls and results pair exactly. `custom`/`custom_message` events (tool_execution_start, async-result, session_exit) become lifecycle/developer rows. `model_change` → model; `model_usage` → session-level usage. The `session` header holds the authoritative start time (the `title` event's `updatedAt` is the *rename* time, not the start). A tool call with no result is reported in `fidelity.unrecovered`.
 
 ## What "complete" means here
 `--md` / `--jsonl` / `--json` are lossless (full bodies). `--transcript` / `--tail` / `--preview` are readable previews; use `--clip N` to make truncation explicit (otherwise transcript bodies are full). A session is flagged `fidelity.complete:false` whenever anything could not be recovered. **Precisely:** `complete` is *transcript-parsing completeness* — true iff every source record parsed and mapped to a row with no unrecoverable gap (each gap listed in `session.fidelity.unrecovered`, e.g. the two `[response interrupted]` Hermes rows, or Agy's protobuf-fallback bytes). Two things are **always separate** from `complete`: (1) session-level `session.usage` token totals (decoded from Agy `gen_metadata`, never summed into transcript rows); (2) the protobuf DB path, used only for metadata and itself flagged `complete:false` as a fallback. `content` is `null`, never invented.
@@ -101,6 +102,7 @@ Date filters use `epoch`, normalized per harness (Hermes seconds, OpenCode milli
 - `--search TERM` (term derived from the session's own first user message) returns that session.
 - Codex: no `world_state`/`turn_context` leak by default; `--include-lifecycle` surfaces them; tool envelope present; list timestamps are dates, not raw keys.
 | Agy: `fidelity.complete:true` via `transcript_full.jsonl`; model recovered from `gen_metadata` (field 1→19 `model_id`) when `settings.json` omits it; `session.usage` token fields decode to sane per-generation values (`output << input`, e.g. 31.6M uncached-input / 271M cache-read for a 4444-step session); `--search` returns the session from the plaintext transcript; `counts()` buckets sum exactly to `msgs` (no double-counting of `reasoning`/`tool_output` into `a_ok`; developer rows get a `d:` bucket).
+| Omp/Pi: the session jsonl is event-sourced — every line is an event with `id`/`parentId`. `message` events carry `role=user|assistant|toolResult`; content parts are `text`/`thinking`/`toolCall`/`image`. A tool result is a **separate `role=toolResult` message** carrying the same `toolCallId` as the call, so calls and results pair exactly (`tool_call` count == `tool_output` count, verified 188/188 on the live session). `custom`/`custom_message` events (tool_execution_start, async-result, …) become lifecycle/developer rows. `model_change` → model; `model_usage` → session-level usage (input/output/cacheRead/cacheWrite/cost), never summed into rows. The `session` header carries the authoritative start time — the `title` event's `updatedAt` is the *rename* time, so the title is stamped with the session start. A tool call with no result is reported in `fidelity.unrecovered`.
 - Ordering (epoch non-decreasing), `--clip` marker, `--export` jsonl==json message count, `all --list`/`all --search` exit 0.
 
 Run: `python3 scripts/test_sessions.py`.

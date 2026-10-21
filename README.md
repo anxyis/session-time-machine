@@ -2,15 +2,15 @@
 
 <p align="center">
   <strong>read back any AI session you ever had — across every harness on your box</strong><br>
-  <sub>Hermes · OpenCode · Cline · Codex · Antigravity</sub>
+  <sub>Hermes · OpenCode · Cline · Codex · Antigravity · Omp · Pi</sub>
 </p>
 
 <p align="center">
   <img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="MIT License" />
   <img src="https://img.shields.io/badge/Python-3.9%2B-blue.svg" alt="Python 3.9+" />
   <img src="https://img.shields.io/badge/deps-none-5865F2" alt="No dependencies" />
-  <img src="https://img.shields.io/badge/harnesses-5-ff69b4" alt="5 harnesses" />
-  <img src="https://img.shields.io/badge/tests-85%2F85%20green-4CAF50" alt="85/85 tests" />
+  <img src="https://img.shields.io/badge/harnesses-7-ff69b4" alt="7 harnesses" />
+  <img src="https://img.shields.io/badge/tests-91%2F91%20green-4CAF50" alt="91/91 tests" />
 </p>
 
 <br/>
@@ -60,8 +60,10 @@ machine buries its history somewhere different:
 | **Cline** | `~/.cline/data/db/sessions.db` + a JSON file it points at |
 | **Codex** | `~/.codex/sessions/*/*/rollout-*.jsonl` |
 | **Antigravity** | `~/.gemini/antigravity-cli/brain/*/…/transcript_full.jsonl` |
+| **Omp** | `~/.omp/agent/sessions/<project>/<ISOts>_<uuid>.jsonl` |
+| **Pi** | `~/.pi/agent/sessions/<project>/<ISOts>_<uuid>.jsonl` |
 
-Five databases, five formats, five schemas. Each one half-documented at best. Digging
+Seven databases, seven formats, seven schemas. Each one half-documented at best. Digging
 through them by hand is miserable.
 
 `session-time-machine` reads **all of them** through one CLI and hands you back the same
@@ -151,9 +153,12 @@ That finds every agent you've got in `$HOME` and copies the skill in. Pick and c
 ./install.sh --uninstall                          # nuke it
 ```
 
-Covers **21** agents: Claude Code, Codex, OpenCode, Cline, Gemini CLI, Antigravity CLI,
+Covers **23** agents: Claude Code, Codex, OpenCode, Cline, Gemini CLI, Antigravity CLI,
 Cursor, Amp, GitHub Copilot, Hermes Agent, Aider Desk, Augment, Crush, Goose, Kilo,
-OpenClaw, Roo, Windsurf, Zed, Warp, and the universal `.agents/skills/`.
+OpenClaw, Roo, Windsurf, Zed, Warp, Pi, Omp, and the universal `.agents/skills/`.
+
+Pi and Omp share one directory (`~/.agents/skills`) — the installer writes it once
+and tells you who else is using it.
 
 ### or via the skills CLI
 
@@ -209,7 +214,7 @@ developed and verified on Linux.
 python3 skills/session-time-machine/scripts/test_sessions.py
 ```
 
-**85 checks, all against live databases** — no mocks, no fixtures. The suite discovers a
+**91 checks, all against live databases** — no mocks, no fixtures. The suite discovers a
 real session per harness at runtime and asserts fidelity, filter, and export invariants
 against actual data. If your harness changes shape, the suite notices.
 

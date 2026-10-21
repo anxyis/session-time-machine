@@ -59,8 +59,14 @@ jobs:
           set -eu
           fail=0
           # patterns that should never appear in a public repo
-          if git grep -nIE 'gh[pousr]_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9]{20,}|sk-ant-[A-Za-z0-9_-]{20,}|AIza[0-9A-Za-z_-]{35}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}' -- . ; then
+          # documented example keys and the synthetic test secret are expected
+          HITS="$(git grep -nIE 'gh[pousr]_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9]{20,}|sk-ant-[A-Za-z0-9_-]{20,}|AIza[0-9A-Za-z_-]{35}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}' -- . \
+            | grep -v 'AKIAIOSFODNN7EXAMPLE' \
+            | grep -v 'EXAMPLEKEYFORTESTSONLY' \
+            | grep -v 'sk-xxx' || true)"
+          if [ -n "$HITS" ]; then
             echo "::error::credential-shaped string found in the repo" >&2
+            echo "$HITS" >&2
             fail=1
           fi
           if git grep -nIE '/home/[a-z0-9_-]+/' -- . ; then

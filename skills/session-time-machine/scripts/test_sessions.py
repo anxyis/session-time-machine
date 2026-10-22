@@ -572,6 +572,115 @@ def main():
     else:
         skip("hermes context state", "no hermes sessions")
 
+    # ---- phase 2: the handoff pack ---------------------------------
+    # The pack is what you paste into a fresh session after a crash. It
+    # must contain the human's real intent (not a harness injection), the
+    # tool calls that never got a result, and a token-budgeted tail.
+    import importlib.util as _ilu
+    _sp = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sessions.py")
+    _spec = _ilu.spec_from_file_location("stm_mod", _sp)
+    stm = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(stm)
+
+    # the unfinished-call rule, on synthetic rows (a session that died
+    # mid-call must be detected)
+    def _R(kind, seq, names=None):
+        return {"kind": kind, "seq": seq, "role": "assistant" if kind == "tool_call"
+                else ("tool" if kind == "tool_output" else "user"),
+                "content": "", "tool_names": names or [], "tool_call_id": None}
+    check("handoff: a call with a result is finished",
+          len(stm._unfinished_calls([_R("tool_call", 1, ["bash"]),
+                                      _R("tool_output", 2)])) == 0)
+    check("handoff: a call with no result is unfinished",
+          len(stm._unfinished_calls([_R("tool_call", 1, ["bash"])])) == 1)
+    check("handoff: a batch of 3 calls is one unfinished batch",
+          len(stm._unfinished_calls([_R("tool_call", 1, ["a"]), _R("tool_call", 2, ["b"]),
+                                      _R("tool_call", 3, ["c"])])) == 1)
+    check("handoff: a batch of 3 calls with a result is finished",
+          len(stm._unfinished_calls([_R("tool_call", 1, ["a"]), _R("tool_call", 2, ["b"]),
+                                      _R("tool_call", 3, ["c"]),
+                                      _R("tool_output", 4)])) == 0)
+    check("handoff: two separate unfinished batches are two",
+          len(stm._unfinished_calls([_R("tool_call", 1, ["a"]), _R("message", 2),
+                                      _R("tool_call", 3, ["b"])])) == 2)
+    check("handoff: the call id is read from the tool_calls json",
+          stm._call_id({"kind": "tool_call", "seq": 1, "tool_names": [],
+                        "tool_call_id": None,
+                        "content": '[{"id": "call_abc123def456", "name": "x"}]'})
+          == "call_abc123def456")
+
+    # injected rows are skipped when finding the intent
+    check("handoff: a compaction notice is not the intent",
+          stm._last_intent([{"role": "user", "content": "[CONTEXT COMPACTION - x]"}])[1] is True)
+    check("handoff: a real message is the intent",
+          stm._last_intent([{"role": "user", "content": "do the thing"}])[1] is False)
+    check("handoff: the last REAL message wins over a later injection",
+          stm._last_intent([{"role": "user", "content": "real request"},
+                            {"role": "user", "content": "[CONTEXT COMPACTION - x]"}])[0]
+          ["content"] == "real request")
+
+    # the CLI, on a real session
+    hs, _hs_tools = first_sid("hermes")
+    if hs:
+        h = run("hermes", "--handoff", hs)
+        check("handoff: exits 0", h.returncode == 0, h.stderr[-160:])
+        out = h.stdout
+        check("handoff: has a LAST INTENT section", "## LAST INTENT" in out)
+        check("handoff: has an IN PROGRESS section", "## IN PROGRESS" in out)
+        check("handoff: has a TAIL section", "## TAIL" in out)
+        check("handoff: says it is untrusted", "untrusted" in out.lower())
+        check("handoff: reports the token budget", "budget" in out.lower())
+        # the tail must be fenced when fencing is on
+        if stm._FENCE:
+            check("handoff: the tail is fenced", "UNTRUSTED CONTENT" in out)
+        # a smaller budget must produce a smaller tail
+        big = run("hermes", "--handoff", hs, "--handoff-budget", "8000").stdout
+        small = run("hermes", "--handoff", hs, "--handoff-budget", "500").stdout
+        check("handoff: a smaller budget gives a smaller tail",
+              len(small) < len(big), f"{len(small)} vs {len(big)}")
+        # and the budget must be respected
+        check("handoff: the budget is reported and respected",
+              "tokens" in small and len(small) < len(big) + 2000, f"{len(small)}")
+        # the handoff pack must redact secrets -- it is the one output
+        # people paste into a fresh session, so a leak here is the worst
+        # place for one
+        import sqlite3 as _sq
+        import tempfile as _tf
+        _d = _tf.mkdtemp()
+        _db = os.path.join(_d, "t.db")
+        _c = _sq.connect(_db)
+        _c.execute("create table sessions(id text, title text, source text, "
+                   "created_at integer, model text, billing_provider text, "
+                   "started_at integer, ended_at integer)")
+        _c.execute("insert into sessions values ('s1','t','hermes',1700000000,"
+                   "'m','v',1700000000,1700000100)")
+        _c.execute("""create table messages(session_id text, role text,
+                       timestamp integer, content text, reasoning_content text,
+                       tool_calls text, api_content text, finish_reason text,
+                       tool_name text, effect_disposition text,
+                       compacted integer default 0, active integer default 1,
+                       _compressed_summary integer default 0)""")
+        _SEC = "sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ012345"
+        _c.execute("insert into messages values ('s1','user',1700000000,?,null,"
+                   "null,null,null,null,null,0,1,0)", (f"key is {_SEC} do it",))
+        _c.execute("insert into messages values ('s1','tool',1700000002,?,null,"
+                   "null,null,null,null,null,0,1,0)", (f"out {_SEC}",))
+        _c.commit(); _c.close()
+        _old_db = os.environ.get("STM_HERMES_DB")
+        os.environ["STM_HERMES_DB"] = _db
+        try:
+            _h = run("hermes", "--handoff", "s1").stdout
+        finally:
+            if _old_db is None:
+                os.environ.pop("STM_HERMES_DB", None)
+            else:
+                os.environ["STM_HERMES_DB"] = _old_db
+        check("handoff: the secret is redacted", _SEC not in _h, "SECRET LEAKED")
+        check("handoff: the redaction is reported",
+              "REDACTED" in _h or "redacted" in _h.lower())
+    else:
+        skip("handoff CLI", "no hermes sessions")
+
     # cross-harness
     check("all --list exits 0", run("all","--list").returncode == 0)
     check("all --search exits 0", run("all","--search","the").returncode == 0)

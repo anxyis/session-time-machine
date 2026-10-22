@@ -119,6 +119,17 @@ python3 scripts/sessions.py hermes --context compacted <ID>
 
 `--peek` prints the split, so you know before you read which of the two you want.
 
+And when a session dies and you need to pick it back up in a new one:
+
+```bash
+# builds one pasteable block: last intent, unfinished tool calls, budgeted tail
+python3 scripts/sessions.py hermes --handoff <ID>
+```
+
+It skips Hermes' own compaction notices when it looks for what you actually asked for,
+finds the tool calls that never got a result, and keeps the tail inside a token budget
+so the new session does not die the same way.
+
 <br/>
 
 ## ◈ it will not make stuff up

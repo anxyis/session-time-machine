@@ -44,6 +44,23 @@ An assistant turn that invoked tools has `content==null` (its payload is the too
 
   This matters when reading a long session: a compacted session is **not** a straight-line conversation of what the model had in context. `--context live` shows only what the model currently sees; `--context compacted` shows only what it no longer sees. `--peek` prints the split.
 
+## The handoff pack (`--handoff`)
+When a session dies and you need to start a new one that knows what you were doing, `--handoff` builds one block of text to paste into the fresh session:
+
+```
+# HANDOFF - hermes session <id>
+- source / session size / context split / tail token count
+## LAST INTENT     the human's own last request
+## IN PROGRESS     tool call batches that never got a result
+## TAIL            the last N rows, token-budgeted, tail-preserving
+```
+
+Two things it gets right that a naive tail would not:
+- **The last intent is not the last user message.** In a compacted session the last user rows are Hermes' own `[CONTEXT COMPACTION ...]` notices. Seeding a new session with one of those is useless, so injected rows are skipped — but if every user row is injected, the pack still reports the last one and says so.
+- **Unfinished tool calls are found by batch, not by row.** One assistant message with N tool calls becomes N consecutive `tool_call` rows sharing a call id, and their results come *after* the run of calls. A batch is finished if tool_output rows follow it before the next message.
+
+The tail is token-budgeted (`--handoff-budget`, default 4000) and keeps the **end** — the question is "what happened before it died". The whole pack goes through the same redaction and the same untrusted-content fence as `--transcript`, because it is a transcript excerpt.
+
 ## Commands (all harnesses)
 ```
 harness = hermes|opencode|cline|codex|agy|all
@@ -61,6 +78,11 @@ python3 $S <harness> --logs N          # agy run logs only
 Filters SELECT rows only — they never mutate a row, so a surviving row is identical with or without filters. Active filters are reported on stderr; stdout stays machine-parseable.
 ```
 --no-tools            drop tool_call/tool_output rows
+--handoff ID          build a handoff pack: last intent, unfinished
+                      tool calls, and a token-budgeted tail, ready to
+                      seed a fresh session
+--handoff-budget N    token budget for the handoff tail (default 4000)
+--handoff-tail N      max rows considered for the tail (default 40)
 --context live       hermes: only the rows in the model's live context
 --context compacted  hermes: only the rows compacted away (content kept)
 --include-lifecycle   un-hide [lifecycle] rows (default: hidden)

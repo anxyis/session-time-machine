@@ -852,9 +852,17 @@ def main():
         _e2.pop("STM_INDEX_LIMIT", None)
         # point hermes at the repo's own fixture db, so the build has a
         # real session to index (an empty dir would index nothing)
-        _e2["STM_HERMES_DB"] = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)),
-            "..", "tests", "fixtures", "hermes_state.db")
+        # find the fixture db in BOTH layouts: the dev tree has it next
+        # to the script, the published repo has it at the repo root
+        _fixdir = None
+        _here = os.path.dirname(os.path.abspath(__file__))
+        for _up in (_here, os.path.dirname(_here), os.path.dirname(os.path.dirname(_here)),
+                    os.path.dirname(os.path.dirname(os.path.dirname(_here)))):
+            _cand = os.path.join(_up, "tests", "fixtures")
+            if os.path.isdir(_cand):
+                _fixdir = _cand
+                break
+        _e2["STM_HERMES_DB"] = os.path.join(_fixdir, "hermes_state.db") if _fixdir else ""
         _e2["STM_OPENCODE_DB"] = os.path.join(_tiny, "o.db")
         _e2["STM_CLINE_DB"] = os.path.join(_tiny, "c.db")
         _e2["STM_CODEX_DIR"] = os.path.join(_tiny, "codex")
@@ -900,9 +908,17 @@ def main():
         _e3 = dict(_env)
         _e3["STM_INDEX_DIR"] = _idx2
         _e3.pop("STM_INDEX_LIMIT", None)
-        _e3["STM_HERMES_DB"] = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)),
-            "..", "tests", "fixtures", "hermes_state.db")
+        # find the fixture db in BOTH layouts: the dev tree has it next
+        # to the script, the published repo has it at the repo root
+        _fixdir = None
+        _here = os.path.dirname(os.path.abspath(__file__))
+        for _up in (_here, os.path.dirname(_here), os.path.dirname(os.path.dirname(_here)),
+                    os.path.dirname(os.path.dirname(os.path.dirname(_here)))):
+            _cand = os.path.join(_up, "tests", "fixtures")
+            if os.path.isdir(_cand):
+                _fixdir = _cand
+                break
+        _e3["STM_HERMES_DB"] = os.path.join(_fixdir, "hermes_state.db") if _fixdir else ""
 
         def _run3(*a, **kw):
             e = dict(_e3)

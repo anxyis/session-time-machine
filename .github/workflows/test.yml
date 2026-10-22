@@ -13,13 +13,20 @@ permissions:
 
 jobs:
   fixtures:
-    name: fixture suite (no live data)
-    runs-on: ubuntu-latest
+    name: fixture suite (py${{ matrix.python }} on ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # more than one python, more than one os: the tool is stdlib-only
+        # and claims to work on macOS (bash 3.2) and Windows
+        os: [ubuntu-latest, macos-latest]
+        python: ['3.9', '3.11']
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
-          python-version: '3.11'
+          python-version: ${{ matrix.python }}
 
       - name: Run the fixture suite
         # Runs against the sanitized fixture corpus in tests/fixtures -- no
@@ -53,6 +60,36 @@ jobs:
           test -f skills/session-time-machine/scripts/sessions.py
           python3 "$T/home/.claude/skills/session-time-machine/scripts/sessions.py" --help >/dev/null
           rm -rf "$T"
+
+  lint:
+    name: lint (undefined names)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.11'
+      - name: Install pyflakes
+        # The SHIPPED code is stdlib-only and needs no pip -- this is a
+        # CI-only tool. If the install fails (no network), the lint
+        # SKIPS rather than failing the build.
+        run: |
+          pip install --quiet pyflakes || echo "PYFLAKES_UNAVAILABLE=1" >> "$GITHUB_ENV"
+      - name: Lint
+        # pyflakes catches undefined names -- the class of bug that let
+        # safety_apply_fence call fence_header(), which does not exist.
+        run: |
+          if [ "$PYFLAKES_UNAVAILABLE" = "1" ]; then
+            echo "pyflakes unavailable -- skipping the lint"
+            exit 0
+          fi
+          out="$(python3 -m pyflakes skills/session-time-machine/scripts/*.py || true)"
+          echo "$out"
+          if echo "$out" | grep -E 'undefined name'; then
+            echo "::error::undefined name in the shipped code"
+            exit 1
+          fi
+          echo "no undefined names"
 
   secret-scan:
     name: no secrets in the repo

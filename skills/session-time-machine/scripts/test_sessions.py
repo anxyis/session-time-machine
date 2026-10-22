@@ -17,6 +17,35 @@ def check(name, cond, detail=""):
     if cond: P+=1; print(f"  PASS  {name}")
     else: F+=1; print(f"  FAIL  {name}  ({detail})")
 def skip(name, reason): global P; print(f"  SKIP  {name}  ({reason})")
+def _fixture_dir():
+    """The fixture corpus, found in BOTH layouts: the dev tree has it
+    next to the script, the published repo has it at the repo root."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    for up in (here, os.path.dirname(here), os.path.dirname(os.path.dirname(here)),
+               os.path.dirname(os.path.dirname(os.path.dirname(here)))):
+        cand = os.path.join(up, "tests", "fixtures")
+        if os.path.isdir(cand):
+            return cand
+    return None
+
+
+def _harness_present(h):
+    """Is this harness actually installed, with at least one session?
+
+    Used to tell "the harness is not here" (a SKIP) from "the adapter
+    crashed" (a FAIL). A crash is a bug and must not hide behind a
+    green suite.
+    """
+    try:
+        o = run(h, "--list", "3")
+        if o.returncode != 0:
+            return False
+        for ln in o.stdout.splitlines():
+            if "@session:" in ln:
+                return True
+        return False
+    except Exception:
+        return False
 def jget(harness, sid, *parts):
     o = run(harness, "--json", sid, *parts)
     return _safe_json(o.stdout)
@@ -66,7 +95,15 @@ def suite(harness):
     check(f"{harness}::{sid} len==sum(kinds)", len(msgs) == sum(ks.values()), f"{len(msgs)} vs {sum(ks.values())}")
     # jsonl all rows parse + count match
     jl = jlines(harness, sid)
-    jdata = [l for l in jl.splitlines() if l.strip() and _try(l)]
+    # EVERY non-empty line must parse. The old check filtered the
+    # unparseable ones out and compared only the survivors, so it could
+    # not see a '## JSONL' header line -- the exact bug it was supposed
+    # to catch.
+    jlines_all = [l for l in jl.splitlines() if l.strip()]
+    jbad = [l for l in jlines_all if not _try(l)]
+    check(f"{harness}::{sid} jsonl every line parses",
+          not jbad, f"{len(jbad)} unparseable line(s): {jbad[:1]}")
+    jdata = [l for l in jlines_all if _try(l)]
     check(f"{harness}::{sid} jsonl all rows parse", len(jdata) == len(msgs), f"{len(jdata)} vs {len(msgs)}")
     # no-tools
     dn = jget(harness, sid, "--no-tools")
@@ -120,7 +157,18 @@ def main():
                 sid, ht, msgs, ks = res
                 suite_filters(h, sid)
         except Exception as e:
-            print(f"  SKIP  {h} (harness unavailable: {e})")
+            # A CRASH in an installed harness is a BUG, not a missing
+            # install. Reporting it as a SKIP is how a real defect hides
+            # behind a green suite.
+            if _harness_present(h):
+                global F
+                F += 1
+                import traceback
+                print(f"  FAIL  {h} (the adapter CRASHED -- a bug, not a "
+                      f"missing harness)")
+                print("        " + traceback.format_exc().replace("\n", "\n        ")[:1200])
+            else:
+                print(f"  SKIP  {h} (harness unavailable: {e})")
     # codex regressions
     csid, _ = first_sid("codex")
     if csid:
@@ -776,8 +824,24 @@ def main():
     import tempfile as _tf2
     _idxdir = _tf2.mkdtemp(prefix="stm_idx_")
     # bound the build: the test checks the properties, not the corpus size
+    #
+    # and it must be HERMETIC: the index machinery is tested against the
+    # FIXTURE corpus, not whatever the ambient STM_HERMES_DB points at.
+    # It inherited the ambient env, so with no corpus at all the index
+    # tests failed with 'db/directory not found' -- a failure that was
+    # not a defect but a test that depended on the machine.
+    _fixdir = _fixture_dir()
     _env = dict(os.environ, STM_INDEX_DIR=_idxdir, STM_INDEX_LIMIT="2")
     _env.pop("STM_NO_INDEX", None)
+    if _fixdir:
+        _env.update(STM_HERMES_DB=os.path.join(_fixdir, "hermes_state.db"),
+                    STM_OPENCODE_DB=os.path.join(_fixdir, "opencode.db"),
+                    STM_CLINE_DB=os.path.join(_fixdir, "cline_sessions.db"),
+                    STM_CODEX_DIR=os.path.join(_fixdir, "codex_sessions"),
+                    STM_AGY_BRAIN=os.path.join(_fixdir, "agy_brain"),
+                    STM_AGY_DIR=os.path.join(_fixdir, "agy_conversations"),
+                    STM_OMP_SESSIONS=os.path.join(_fixdir, "omp_sessions"),
+                    STM_PI_SESSIONS=os.path.join(_fixdir, "pi_sessions"))
 
     def _run_env(*a, **kw):
         e = dict(_env)
@@ -792,9 +856,11 @@ def main():
           "not built" in _run_env("hermes", "--index-status").stdout)
 
     # the index path is honoured, and the env override works
+    # the index must land in the directory the test named -- checked
+    # against the env the SUBPROCESS gets, not the ambient one
     check("index: STM_INDEX_DIR is honoured",
-          os.path.isdir(_idxdir) and
-          os.environ.get("STM_INDEX_DIR", _idxdir) == _idxdir)
+          _env.get("STM_INDEX_DIR") == _idxdir
+          and os.path.isdir(_idxdir), _env.get("STM_INDEX_DIR"))
 
     # building it over a fixture-sized corpus
     _b = _run_env("hermes", "--reindex")

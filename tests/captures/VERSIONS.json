@@ -1,8 +1,8 @@
 {
- "hermes": "Hermes Agent v0.21.3 (2026.9.14) \u00b7 upstream e83b1d51 \u00b7 local",
- "omp": "present",
- "pi": "present",
- "codex": "present",
- "cline": "present",
- "opencode": "present"
+ "hermes": "Hermes Agent v0.21.3 (2026.9.14) · upstream e83b1d51 · local",
+ "omp": "omp/18.6.1",
+ "pi": "0.84.2",
+ "codex": "codex-cli 0.149.0",
+ "cline": "3.0.67",
+ "opencode": "not installed on the capture machine (the session was read from a shared db)"
 }

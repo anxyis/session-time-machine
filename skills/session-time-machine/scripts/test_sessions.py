@@ -524,6 +524,54 @@ def main():
     except Exception as _e:
         check("safety: locked-db snapshot handling", False, str(_e)[:80])
 
+    # ---- phase 1: hermes context state (compacted / active) -----------
+    # A row that was compacted away still has its content, but the model
+    # sees a summary instead. The tool must not present a compacted
+    # transcript as if it were the model's live context.
+    hctx = jget("hermes", first_sid("hermes")[0] or "")
+    if hctx.get("messages"):
+        hm = hctx["messages"]
+        tagged = [x for x in hm if (x.get("tags") or [])]
+        check("hermes: rows carry a context state",
+              len(tagged) == len(hm), f"{len(tagged)}/{len(hm)} tagged")
+        states = set()
+        for x in tagged:
+            # the context state is one of the three; `redacted` is a separate
+            # safety tag that can co-occur on the same row
+            ctx_tags = [t for t in (x.get("tags") or [])
+                        if t in ("live", "compacted", "retained")]
+            states.update(ctx_tags)
+        check("hermes: context states are known",
+              states <= {"live", "compacted", "retained"}, str(sorted(states)))
+        check("hermes: every row has exactly one context state",
+              all(len([t for t in (x.get("tags") or [])
+                       if t in ("live", "compacted", "retained")]) == 1
+                  for x in tagged),
+              "a row has 0 or 2+ context states")
+        fid = hctx.get("session", {}).get("fidelity", {})
+        cx = fid.get("context") or {}
+        check("hermes: fidelity reports the context split",
+              isinstance(cx, dict) and "live" in cx and "compacted" in cx, str(cx))
+        # the split must add up to the row count
+        check("hermes: the context split sums to the row count",
+              sum(cx.values()) == len(hm), f"{sum(cx.values())} vs {len(hm)}")
+        # --context live must keep only live rows
+        hl = jget("hermes", first_sid("hermes")[0] or "", "--context", "live")
+        hlm = hl.get("messages") or []
+        check("hermes: --context live keeps only live rows",
+              bool(hlm) and all("live" in (x.get("tags") or []) for x in hlm),
+              f"{len(hlm)} rows")
+        hc = jget("hermes", first_sid("hermes")[0] or "", "--context", "compacted")
+        hcm = hc.get("messages") or []
+        check("hermes: --context compacted keeps only compacted rows",
+              all("compacted" in (x.get("tags") or []) for x in hcm),
+              f"{len(hcm)} rows")
+        check("hermes: --context live and compacted are disjoint",
+              not ({(x.get("tags") or [None])[0] for x in hlm}
+                   & {(x.get("tags") or [None])[0] for x in hcm}), "overlap")
+    else:
+        skip("hermes context state", "no hermes sessions")
+
     # cross-harness
     check("all --list exits 0", run("all","--list").returncode == 0)
     check("all --search exits 0", run("all","--search","the").returncode == 0)

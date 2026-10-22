@@ -269,9 +269,20 @@ def fidelity_report(rows, sid=None, harness=None):
         words += len(r["content"] or "")
         for u in r["unrecovered"]:
             unrec.append(f"seq{r['seq']}: {u}")
+    # context split (Phase 1): how much of this session the model still sees
+    # vs how much was compacted away. "retained" = older rows, kept, not
+    # compacted, just outside the current window.
+    ctxc = {"live": 0, "compacted": 0, "retained": 0}
+    for r in rows:
+        t = r.get("tags") or []
+        for k in ("live", "compacted", "retained"):
+            if k in t:
+                ctxc[k] += 1
+                break
     return {
         "harness": harness, "id": sid, "rows": len(rows), "by_kind": c,
         "content_chars": words,
+        "context": ctxc,
         "unrecovered": unrec,
         "complete": len(unrec) == 0,
     }
@@ -285,6 +296,10 @@ class Filt:
         self.kinds = _csv(getattr(a, "kind", None))
         self.model = getattr(a, "model", None)
         self.provider = getattr(a, "provider", None)
+        # context-state filter (Phase 1): "live" keeps only the rows the
+        # model currently sees; "compacted" keeps only the ones that were
+        # compacted away (content retained, but superseded by a summary).
+        self.ctx = getattr(a, "context", None)
         self.since = getattr(a, "since", None)
         self.until = getattr(a, "until", None)
         self.date = getattr(a, "date", None)
@@ -302,6 +317,10 @@ class Filt:
             if r["kind"] == "lifecycle" and not self.include_lifecycle:
                 continue
             if self.no_tools and r["kind"] in ("tool_call", "tool_output"):
+                continue
+            if self.ctx == "live" and "live" not in (r.get("tags") or []):
+                continue
+            if self.ctx == "compacted" and "compacted" not in (r.get("tags") or []):
                 continue
             if self.roles and r["role"] not in self.roles:
                 continue
@@ -463,6 +482,7 @@ def _json_msg(r):
             "tool_names": r["tool_names"] or None, "is_error": r["is_error"],
             "tool_call_id": r.get("tool_call_id"),
             "sub": r.get("sub") or None,
+            "tags": r.get("tags") or None,
             "attachments": r["attachments"] or None,
             "unrecovered": r["unrecovered"] or None}
 
@@ -532,40 +552,52 @@ def _hermes_rows(sid):
     model, provider = (r or (None, None))
     dbrows = db.execute(
         "select role, timestamp, content, reasoning_content, tool_calls, "
-        "api_content, finish_reason, tool_name, effect_disposition from messages "
+        "api_content, finish_reason, tool_name, effect_disposition, "
+        "compacted, active, _compressed_summary from messages "
         "where session_id=? and role!='session_meta' order by timestamp", (sid,)).fetchall()
     if not dbrows:
         return []
     out = []
-    for i, (role, ts, content, reasoning, tcs, api_content, finish, tname, eff) in enumerate(dbrows):
+    for i, (role, ts, content, reasoning, tcs, api_content, finish, tname, eff,
+            compacted, active, csum) in enumerate(dbrows):
         names = _tool_names(tcs)
+        # Context state of this row:
+        #   live      -- in the model's live context right now
+        #   compacted -- superseded by a context compaction; content is still
+        #                here, but the model sees a summary instead
+        #   retained  -- older, kept, not compacted, outside the current window
+        ctx = "live" if active else ("compacted" if compacted else "retained")
         if role == "tool":
             out.append(row("hermes", sid, i, "tool", ist(ts), "tool_output",
-                           content=content, model=model, provider=provider, epoch=ts))
+                           content=content, model=model, provider=provider, epoch=ts,
+                           tags=[ctx]))
         elif role == "assistant":
             rc = reasoning or ""
             is_err = bool(finish and "stop" in str(finish) and eff and "error" in str(eff).lower())
             if content:
                 out.append(row("hermes", sid, i, "assistant", ist(ts), "message", content=content,
                                reasoning=rc, tool_names=names, model=model, provider=provider,
-                               epoch=ts, is_error=is_err))
+                               epoch=ts, is_error=is_err, tags=[ctx]))
             elif names:
                 out.append(row("hermes", sid, i, "assistant", ist(ts), "tool_call", reasoning=rc,
                                content=_verbatim(tcs),
                                tool_names=names, tool_call_id=tname, model=model, provider=provider,
-                               epoch=ts, sub="tool_call: " + ", ".join(clip(x,100) for x in names)))
+                               epoch=ts, tags=[ctx],
+                               sub="tool_call: " + ", ".join(clip(x,100) for x in names)))
             elif rc:
                 out.append(row("hermes", sid, i, "assistant", ist(ts), "reasoning", reasoning=rc,
-                               model=model, provider=provider, epoch=ts))
+                               model=model, provider=provider, epoch=ts, tags=[ctx]))
             elif api_content:
                 out.append(row("hermes", sid, i, "assistant", ist(ts), "empty", model=model, provider=provider,
-                               epoch=ts, unrecovered=[f"api_content present: {str(api_content)[:40]!r}"]))
+                               epoch=ts, tags=[ctx],
+                               unrecovered=[f"api_content present: {str(api_content)[:40]!r}"]))
             else:
                 out.append(row("hermes", sid, i, "assistant", ist(ts), "empty", model=model, provider=provider,
-                               epoch=ts, unrecovered=["content empty; no tool_calls/reasoning/api_content"]))
+                               epoch=ts, tags=[ctx],
+                               unrecovered=["content empty; no tool_calls/reasoning/api_content"]))
         else:  # user
             out.append(row("hermes", sid, i, "user", ist(ts), "message", content=content,
-                           model=model, provider=provider, epoch=ts))
+                           model=model, provider=provider, epoch=ts, tags=[ctx]))
     return out
 # ---------- OPENCODE adapter (V2: message=metadata, part=content) ----------
 
@@ -2179,6 +2211,15 @@ def _peek(tool, sid):
         for u in fr["unrecovered"]: print(f"    - {u}")
     else:
         print(f"fidelity:       complete (no gaps)")
+    ctx = fr.get("context") or {}
+    if any(ctx.values()):
+        print(f"context:      live={ctx.get('live', 0)} "
+              f"compacted-away={ctx.get('compacted', 0)} "
+              f"retained={ctx.get('retained', 0)}")
+        if ctx.get("compacted"):
+            print("               (compacted rows were superseded by a context")
+            print("                compaction -- content is retained, but the model")
+            print("                no longer sees it. --context live|compacted)")
     if rows:
         fu = clip(next((r["content"] for r in rows if r["role"] == "user" and r["content"]), ''), 120)
         print(f"first user:   {fu or '(none)'}")
@@ -2378,6 +2419,9 @@ def main():
     ap.add_argument("--tool", help="tool name substring")
     ap.add_argument("--errors", action="store_true")
     ap.add_argument("--no-tools", action="store_true")
+    ap.add_argument("--context", choices=["live", "compacted"], default=None,
+                    help="hermes: keep only rows in the model's live context, "
+                         "or only rows that were compacted away")
     ap.add_argument("--include-lifecycle", action="store_true")
     ap.add_argument("--redact", dest="redact", action="store_true", default=None,
                     help="redact secrets from output (default: on)")

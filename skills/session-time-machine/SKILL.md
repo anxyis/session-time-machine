@@ -37,6 +37,12 @@ An assistant turn that invoked tools has `content==null` (its payload is the too
 - `[thinking:N — CoT, not the reply]` — reasoning/CoT is labeled and must not be read as the reply.
 - `[empty: … — DO NOT FABRICATE]` — content/tool_calls/reasoning/api_content all absent: genuinely unrecoverable, `content=null`.
 - `[lifecycle]` — harness bookkeeping (Codex `world_state`/`turn_context`, Agy run steps); hidden by default, shown with `--include-lifecycle`.
+- **context state** (Hermes) — every row carries one of three states, in the `tags` field of `--json`/`--jsonl`:
+  - `live` — the row is in the model's live context right now.
+  - `compacted` — the row was **superseded by a context compaction**. Its content is still in the database, but the model no longer sees it; a summary replaced it.
+  - `retained` — older row, kept, not compacted, just outside the current window.
+
+  This matters when reading a long session: a compacted session is **not** a straight-line conversation of what the model had in context. `--context live` shows only what the model currently sees; `--context compacted` shows only what it no longer sees. `--peek` prints the split.
 
 ## Commands (all harnesses)
 ```
@@ -55,6 +61,8 @@ python3 $S <harness> --logs N          # agy run logs only
 Filters SELECT rows only — they never mutate a row, so a surviving row is identical with or without filters. Active filters are reported on stderr; stdout stays machine-parseable.
 ```
 --no-tools            drop tool_call/tool_output rows
+--context live       hermes: only the rows in the model's live context
+--context compacted  hermes: only the rows compacted away (content kept)
 --include-lifecycle   un-hide [lifecycle] rows (default: hidden)
 --role user,assistant,...      keep roles
 --kind message,tool_call,...   keep kinds
@@ -125,6 +133,7 @@ a 2.8M-char dump into an agent's context is what killed the 2026-10-21 session.
 - `--no-tools` removes exactly the `tool_call`/`tool_output` kinds and preserves every other row.
 - `--role`/`--model` filters are real selections (keep matches, drop the rest).
 - `--search TERM` (term derived from the session's own first user message) returns that session.
+- Hermes: the `compacted`/`active` flags are surfaced per row, and the peek/fidelity report shows the live / compacted-away / retained split. A long session is typically ~10% live, ~65% compacted-away, ~25% retained — so a transcript presented without this split overstates what the model actually had in context.
 - Codex: no `world_state`/`turn_context` leak by default; `--include-lifecycle` surfaces them; tool envelope present; list timestamps are dates, not raw keys.
 | Agy: `fidelity.complete:true` via `transcript_full.jsonl`; model recovered from `gen_metadata` (field 1→19 `model_id`) when `settings.json` omits it; `session.usage` token fields decode to sane per-generation values (`output << input`, e.g. 31.6M uncached-input / 271M cache-read for a 4444-step session); `--search` returns the session from the plaintext transcript; `counts()` buckets sum exactly to `msgs` (no double-counting of `reasoning`/`tool_output` into `a_ok`; developer rows get a `d:` bucket).
 | Omp/Pi: the session jsonl is event-sourced — every line is an event with `id`/`parentId`. `message` events carry `role=user|assistant|toolResult`; content parts are `text`/`thinking`/`toolCall`/`image`. A tool result is a **separate `role=toolResult` message** carrying the same `toolCallId` as the call, so calls and results pair exactly (`tool_call` count == `tool_output` count, verified 188/188 on the live session). `custom`/`custom_message` events (tool_execution_start, async-result, …) become lifecycle/developer rows. `model_change` → model; `model_usage` → session-level usage (input/output/cacheRead/cacheWrite/cost), never summed into rows. The `session` header carries the authoritative start time — the `title` event's `updatedAt` is the *rename* time, so the title is stamped with the session start. A tool call with no result is reported in `fidelity.unrecovered`.

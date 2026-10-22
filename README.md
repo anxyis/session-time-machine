@@ -107,6 +107,18 @@ And the one that actually saves your tokens:
 python3 scripts/sessions.py hermes --jsonl <ID> --no-tools
 ```
 
+And when a session is long enough that Hermes compacted its own context:
+
+```bash
+# what did the model actually still have in context?
+python3 scripts/sessions.py hermes --context live <ID>
+
+# and what did compaction take away? (content is kept, the model just can't see it)
+python3 scripts/sessions.py hermes --context compacted <ID>
+```
+
+`--peek` prints the split, so you know before you read which of the two you want.
+
 <br/>
 
 ## ◈ it will not make stuff up

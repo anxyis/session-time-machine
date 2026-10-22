@@ -17,8 +17,10 @@ import subprocess
 import sys
 import tempfile
 
-REPO = "/home/ubuntu/projects/session-time-machine"
-DEV = "/home/ubuntu/.hermes/skills/devops/session-time-machine"
+REPO = os.path.dirname(os.path.abspath(__file__))
+# the dev tree, wherever it lives (no hardcoded home path -- the repo's
+# own scan flags them)
+DEV = os.path.expanduser("~/.hermes/skills/devops/session-time-machine")
 BUGS = []
 N = 0
 
@@ -121,11 +123,15 @@ if os.path.isdir(cap):
         txt = open(p, encoding="utf-8", errors="replace").read()
         # does it look like personal chat?
         personal = []
+        # only what actually matters: an email, a home path, a
+        # credential, a national id. NOT a long number -- those are
+        # epoch timestamps in a transcript.
         for pat, label in ((r"[\w.]+@[\w.]+\.\w+", "an email"),
                            (r"/home/[a-z0-9_-]+", "a home path"),
-                           (r"\b(?:my|I) (?:wife|husband|girlfriend|boyfriend|mum|mom|dad|son|daughter|family|doctor|therapist|salary)\b", "personal detail"),
+                           (r"gh[pousr]_[A-Za-z0-9]{16,}", "a github token"),
+                           (r"sk-[A-Za-z0-9]{20,}", "an api key"),
                            (r"\b\d{3}-\d{2}-\d{4}\b", "an SSN-like number"),
-                           (r"\b(?:\+?\d[\d \-()]{8,})\b", "a phone number")):
+                           (r"(?<![\d.])\+?\d{2,3}[\s-]?\(?\d{3}\)?[\s-]?\d{3}[\s-]?\d{4}(?![\d.])", "a phone number")):
             mm = re.search(pat, txt, re.I)
             if mm:
                 personal.append(f"{label}: {mm.group(0)[:40]}")

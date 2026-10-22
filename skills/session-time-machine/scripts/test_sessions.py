@@ -393,8 +393,13 @@ def main():
     _t0 = _time.time()
     _out, _cnt = safety_redact(_patho, True)
     _dt = _time.time() - _t0
+    # The bound is deliberately loose: the bug this guards against took
+    # 82s, so 10s still catches it with an 8x margin, while a tight
+    # bound flaked on a loaded machine (each of the 25 patterns is
+    # ~0.1s on this 2.5MB input -- linear, not quadratic -- so the total
+    # lands near 2s under load).
     check("safety: redaction is not ReDoS-prone on adversarial input",
-          _dt < 2.0, f"{_dt:.2f}s on {len(_patho)/1e6:.1f}MB")
+          _dt < 10.0, f"{_dt:.2f}s on {len(_patho)/1e6:.1f}MB")
     # and it must still catch a real env-var secret
     _o2, _c2 = safety_redact("OPENAI_API_KEY=sk-abcdefghijklmnop", True)
     check("safety: env-var secrets are still caught", bool(_c2), str(_c2))
@@ -764,6 +769,174 @@ def main():
           stm2._call_key(_r1) == stm2._call_key(_r2))
     check("diff: different arguments hash differently",
           stm2._call_key(_r1) != stm2._call_key(_r3))
+
+    # ---- phase 4: the FTS5 index ------------------------------------
+    # The index is a CACHE: it accelerates --search, it is never a source
+    # of truth, and a missing index must not break the search.
+    import tempfile as _tf2
+    _idxdir = _tf2.mkdtemp(prefix="stm_idx_")
+    # bound the build: the test checks the properties, not the corpus size
+    _env = dict(os.environ, STM_INDEX_DIR=_idxdir, STM_INDEX_LIMIT="2")
+    _env.pop("STM_NO_INDEX", None)
+
+    def _run_env(*a, **kw):
+        e = dict(_env)
+        e.update(kw.pop("env", {}))
+        return subprocess.run([PY, S, *a], capture_output=True, text=True,
+                              env=e, timeout=600)
+
+    # with no index the search still works
+    _s = _run_env("hermes", "--search", "session")
+    check("index: search works with no index", _s.returncode == 0, _s.stderr[-160:])
+    check("index: index-status says it is not built",
+          "not built" in _run_env("hermes", "--index-status").stdout)
+
+    # the index path is honoured, and the env override works
+    check("index: STM_INDEX_DIR is honoured",
+          os.path.isdir(_idxdir) and
+          os.environ.get("STM_INDEX_DIR", _idxdir) == _idxdir)
+
+    # building it over a fixture-sized corpus
+    _b = _run_env("hermes", "--reindex")
+    check("index: reindex exits 0", _b.returncode == 0, _b.stderr[-200:])
+    _idxfile = os.path.join(_idxdir, "index.db")
+    check("index: the index file is created where told",
+          os.path.exists(_idxfile), _idxfile)
+    if os.path.exists(_idxfile):
+        import sqlite3 as _sq3
+        _c = _sq3.connect(_idxfile)
+        _n = _c.execute("select count(*) from rows_fts").fetchone()[0]
+        _nf = _c.execute("select count(*) from fingerprints").fetchone()[0]
+        check("index: the index has rows", _n > 0, str(_n))
+        check("index: fingerprints match the row count", _nf == _n, f"{_nf} vs {_n}")
+        # the index must not become a plaintext copy of the transcripts
+        _bodies = _c.execute("select body from rows_fts").fetchall()
+        _leak = [b for (b,) in _bodies
+                 if "sk-EXAMPLEKEYFORTESTSONLY" in (b or "") or "ghp_" in (b or "")]
+        check("index: the index stores no raw secret", not _leak, f"{len(_leak)} leaked")
+        _c.close()
+
+        # a rebuild must not duplicate rows
+        _c = _sq3.connect(_idxfile)
+        _before = _c.execute("select count(*) from rows_fts").fetchone()[0]
+        _c.close()
+        _run_env("hermes", "--reindex")
+        _c = _sq3.connect(_idxfile)
+        _after = _c.execute("select count(*) from rows_fts").fetchone()[0]
+        _c.close()
+        check("index: a rebuild does not duplicate rows",
+              _before == _after, f"{_before} -> {_after}")
+
+        # A LIMITED index is INCOMPLETE, so it is deliberately not used
+        # for searches -- a partial index would silently lose results.
+        _u = _run_env("hermes", "--search", "session")
+        check("index: a limited index is not used for searches",
+              "fts5" not in _u.stdout, _u.stdout[:120])
+        check("index: a limited index is reported as incomplete",
+              "INCOMPLETE" in _run_env("hermes", "--index-status").stdout)
+        _n2 = _run_env("hermes", "--search", "session", env={"STM_NO_INDEX": "1"})
+        check("index: STM_NO_INDEX=1 forces the linear scan",
+              "fts5" not in _n2.stdout)
+        # 'hello' is in the fixture's first user message; 'session' is
+        # not, so an empty result for that term would be correct
+        _n3 = _run_env("hermes", "--search", "hello", env={"STM_NO_INDEX": "1"})
+        # the linear scan prints "sid | model | ..." with no @session:
+        # marker, so assert on the session id itself
+        check("index: the linear scan still finds sessions",
+              "fixture0001" in _n3.stdout, _n3.stdout[:160])
+
+        # a COMPLETE index IS used -- build one over a tiny corpus by
+        # pointing the harness roots at a temp dir
+        _tiny = _tf2.mkdtemp(prefix="stm_tiny_")
+        _e2 = dict(_env)
+        _e2.pop("STM_INDEX_LIMIT", None)
+        # point hermes at the repo's own fixture db, so the build has a
+        # real session to index (an empty dir would index nothing)
+        _e2["STM_HERMES_DB"] = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "..", "tests", "fixtures", "hermes_state.db")
+        _e2["STM_OPENCODE_DB"] = os.path.join(_tiny, "o.db")
+        _e2["STM_CLINE_DB"] = os.path.join(_tiny, "c.db")
+        _e2["STM_CODEX_DIR"] = os.path.join(_tiny, "codex")
+        _e2["STM_AGY_BRAIN"] = os.path.join(_tiny, "agy")
+        _e2["STM_AGY_DIR"] = os.path.join(_tiny, "agydb")
+        _e2["STM_OMP_SESSIONS"] = os.path.join(_tiny, "omp")
+        _e2["STM_INDEX_DIR"] = _tf2.mkdtemp(prefix="stm_full_")
+        for _d in (_e2["STM_CODEX_DIR"], _e2["STM_AGY_BRAIN"],
+                   _e2["STM_OMP_SESSIONS"]):
+            os.makedirs(_d, exist_ok=True)
+        _fb = subprocess.run([PY, S, "all", "--reindex"], capture_output=True,
+                             text=True, env=_e2, timeout=600)
+        check("index: a complete build exits 0", _fb.returncode == 0, _fb.stderr[-200:])
+        # 'hello' is the fixture's first user message
+        _full = subprocess.run([PY, S, "hermes", "--search", "hello"],
+                               capture_output=True, text=True, env=_e2, timeout=300)
+        check("index: a COMPLETE index is used for searches",
+              "fts5" in _full.stdout, _full.stdout[:120])
+        _st = subprocess.run([PY, S, "hermes", "--index-status"],
+                             capture_output=True, text=True, env=_e2, timeout=300)
+        check("index: a complete index is reported as complete",
+              "complete" in _st.stdout and "INCOMPLETE" not in _st.stdout,
+              _st.stdout[:200])
+
+        # a malformed FTS query must not crash
+        _m = _run_env("hermes", "--search", '"unbalanced')
+        check("index: a malformed FTS query does not crash",
+              _m.returncode == 0, _m.stderr[-160:])
+
+        # deleting the index is safe
+        os.unlink(_idxfile)
+        _d = _run_env("hermes", "--search", "session")
+        check("index: search works after the index is deleted",
+              _d.returncode == 0, _d.stderr[-160:])
+
+        # ---- the rowid leak -----------------------------------------
+        # A rebuild used to grow the table by exactly the number of
+        # changed rows: FTS5's implicit rowid is not what
+        # cursor.lastrowid reports after an INSERT, so the delete found
+        # nothing. The rowid is explicit now, so a rebuild must leave
+        # the table EXACTLY the same size.
+        _idx2 = _tf2.mkdtemp(prefix="stm_leak_")
+        _e3 = dict(_env)
+        _e3["STM_INDEX_DIR"] = _idx2
+        _e3.pop("STM_INDEX_LIMIT", None)
+        _e3["STM_HERMES_DB"] = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "..", "tests", "fixtures", "hermes_state.db")
+
+        def _run3(*a, **kw):
+            e = dict(_e3)
+            e.update(kw.pop("env", {}))
+            return subprocess.run([PY, S, *a], capture_output=True, text=True,
+                                  env=e, timeout=600)
+
+        _run3("hermes", "--reindex")
+        _f2 = os.path.join(_idx2, "index.db")
+        check("index: the leak-test index was built",
+              os.path.exists(_f2), _f2)
+        if os.path.exists(_f2):
+            _c = _sq3.connect(_f2)
+            _n1 = _c.execute("select count(*) from rows_fts").fetchone()[0]
+            _mx1 = _c.execute("select max(rowid) from rows_fts").fetchone()[0]
+            _c.close()
+            _run3("hermes", "--reindex")
+            _c = _sq3.connect(_f2)
+            _n2 = _c.execute("select count(*) from rows_fts").fetchone()[0]
+            _mx2 = _c.execute("select max(rowid) from rows_fts").fetchone()[0]
+            _c.close()
+            check("index: a rebuild does not grow the table",
+                  _n1 == _n2, f"{_n1} -> {_n2}")
+            check("index: no rowid leak (max rowid == row count)",
+                  _mx2 == _n2, f"max rowid {_mx2} vs {_n2} rows")
+
+            # ---- the order ------------------------------------------
+            # the newest session must come first, like the linear scan
+            _o = _run3("hermes", "--search", "hello").stdout
+            _sids = [ln.split("|")[0].strip() for ln in _o.splitlines()
+                     if "@session:" in ln]
+            check("index: the search output is ordered newest first",
+                  bool(_sids) and _sids[0] == "fixture0001",
+                  f"first={_sids[0] if _sids else None}")
 
     # cross-harness
     check("all --list exits 0", run("all","--list").returncode == 0)

@@ -44,6 +44,20 @@ An assistant turn that invoked tools has `content==null` (its payload is the too
 
   This matters when reading a long session: a compacted session is **not** a straight-line conversation of what the model had in context. `--context live` shows only what the model currently sees; `--context compacted` shows only what it no longer sees. `--peek` prints the split.
 
+## The search index (`--reindex`)
+`--search` used to be a linear scan of every session file in every harness. On this box that is 264,738 rows across the sqlite stores plus 5.8 MB of JSONL, and a search took **8.8 seconds**.
+
+`--reindex` builds a local FTS5 index at `~/.cache/session-time-machine/index.db` (override with `STM_INDEX_DIR`). The same search then takes **0.55 seconds** — 16x faster.
+
+The rules that keep it honest, each one added because a test caught the opposite:
+- **The index is a cache, never a source of truth.** It stores the *redacted* text, so it cannot become a plaintext copy of your transcripts. Deleting it loses nothing; the search falls back to the scan.
+- **An incomplete index is never used.** `--index-limit` (or `STM_INDEX_LIMIT`) builds a partial index, and a partial index would silently *lose* results — so it is marked incomplete and searches use the scan instead. `--index-status` says which you have.
+- **It is tied to the corpus it was built from.** The harness data roots are fingerprinted into the index; if they change (a fixture directory, a different db), the index does not describe what you are searching, so it is not used.
+- **The rebuild is incremental.** Each row carries a fingerprint; only changed rows are re-indexed. A second run over an unchanged corpus re-indexes almost nothing. Agy sessions are the exception — their transcripts are live-appended, so their rows do change.
+- **FTS5 tokenizes, the scan does substring matching.** So the FTS5 match is only a *candidate* set; the authoritative substring check runs inside the index. The index can make a search faster, never change what it finds.
+
+`STM_NO_INDEX=1` forces the linear scan, which is what you want when you want the old behaviour or when the index is stale.
+
 ## Inspecting without reading (`--summary`, `--diff`)
 `--summary ID` prints the shape of a session: row count, content and reasoning size, a role/kind breakdown with percentages, the tool-usage histogram, the fidelity verdict, and the opening prompt plus the closing answer. It is computed from row metadata, so it never puts the transcript in your context. On the 2,898-row sample session the summary is ~1.5 KB against a 2.8M-char transcript.
 
@@ -87,6 +101,10 @@ python3 $S <harness> --logs N          # agy run logs only
 Filters SELECT rows only — they never mutate a row, so a surviving row is identical with or without filters. Active filters are reported on stderr; stdout stays machine-parseable.
 ```
 --no-tools            drop tool_call/tool_output rows
+--reindex             update the local FTS5 search index (incremental)
+--reindex-force       rebuild the search index from scratch
+--index-status        what is in the search index
+--index-limit N       index at most N sessions per harness
 --summary ID          session shape, token footprint, tool usage --
                       without reading the transcript
 --diff ID_A ID_B      compare two sessions: structure, modified tool

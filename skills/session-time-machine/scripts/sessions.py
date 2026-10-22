@@ -1025,7 +1025,13 @@ def codex_search(term):
             except Exception: continue
             t = o.get("type")
             if t == "session_meta":
-                sid_f = o.get("session_id") or o.get("id") or sid_f; st = o.get("timestamp")
+                # the id lives in payload.session_id -- reading it from the
+                # top level left the rollout FILENAME as the id, so the
+                # search and --list disagreed about the same session
+                _pl = o.get("payload") or {}
+                sid_f = (_pl.get("session_id") or o.get("session_id")
+                         or o.get("id") or sid_f)
+                st = o.get("timestamp")
             elif t == "response_item":
                 payload = o.get("payload") or {}
                 for blk in (payload.get("content") or []):
@@ -2279,6 +2285,13 @@ def _budget_rows(rows, limit, sid, action):
     return kept + [marker], {"shown": used, "total": total}
 
 
+class _NoFilter:
+    """A pass-through filter, for code paths that load rows without the
+    CLI's filters (the index rebuild)."""
+    def apply(self, rows):
+        return rows
+
+
 def _load_rows(tool, sid, filt):
     rows, info = _get_rows(tool, sid)
     rows = filt.apply(rows)
@@ -2345,6 +2358,14 @@ def _export(rows, sid, tool, a, c, info=None):
     _notice(f"exported {len(rows)} rows to {a.out} ({a.format})")
 
 def _do_search(tool, term, filt):
+    # the index is a cache: if it is there, use it; if not, fall back to
+    # the linear scan. The user never has to think about it.
+    if tool == "all" and _index_usable():
+        _do_indexed_search(term)
+        return
+    if tool != "all" and _index_usable():
+        _do_indexed_search(term, tool)
+        return
     if tool == "all":
         for h in HARNESSES:
             print(f"## -- search {term!r} in {h} --")
@@ -2841,8 +2862,540 @@ def _diff(tool, sid_a, sid_b, a, filt):
     print("\n".join(out))
 
 
+# ---------------------------------------------------------------- FTS5 index
+# The index is a CACHE, never a source of truth. It accelerates --search;
+# if it is missing or stale the search still works, just slower.
+_INDEX_DIR = os.environ.get("STM_INDEX_DIR") or os.path.expanduser("~/.cache/session-time-machine")
+_INDEX_FILE = os.path.join(_INDEX_DIR, "index.db")
+# a source file older than this is re-read; newer is trusted
+_INDEX_SCHEMA = 1
+# set from --index-limit at startup
+_INDEX_LIMIT = None
+
+
+def _index_path():
+    return _INDEX_FILE
+
+
+def _index_connect(create=False):
+    path = _index_path()
+    if not create and not os.path.exists(path):
+        return None
+    if create:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+    con = sqlite3.connect(path, timeout=10)
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("""create table if not exists meta(k text primary key, v text)""")
+    # FTS5 takes BARE column names -- no types. Every column is TEXT.
+    con.execute("""create virtual table if not exists rows_fts using fts5(
+                   harness, sid, role, kind, body, epoch,
+                   tokenize='unicode61')""")
+    con.execute("""create table if not exists fingerprints(
+                   harness text, sid text, seq integer, fp text,
+                   rowid integer, epoch real,
+                   primary key(harness, sid, seq))""")
+    # a fingerprints table from an older schema has no `rowid` column --
+    # the incremental rebuild needs it to delete a changed row
+    fcols = [r[1] for r in con.execute("pragma table_info(fingerprints)")]
+    if "epoch" not in fcols:
+        con.execute("drop table fingerprints")
+        con.execute("""create table fingerprints(
+                       harness text, sid text, seq integer, fp text,
+                       rowid integer, epoch real,
+                       primary key(harness, sid, seq))""")
+        con.execute("delete from rows_fts")
+    elif "rowid" not in fcols:
+        con.execute("drop table fingerprints")
+        con.execute("""create table fingerprints(
+                       harness text, sid text, seq integer, fp text,
+                       rowid integer,
+                       primary key(harness, sid, seq))""")
+        con.execute("delete from rows_fts")
+    # the fts table's shape changed (epoch column) -> the old one must go
+    ftscols = [r[1] for r in con.execute("pragma table_info(rows_fts)")]
+    if "epoch" not in ftscols:
+        con.execute("drop table if exists rows_fts")
+        con.execute("""create virtual table rows_fts using fts5(
+                       harness, sid, role, kind, body, epoch,
+                       tokenize='unicode61')""")
+        con.execute("delete from fingerprints")
+    # a schema version bump invalidates the whole index
+    row = con.execute("select v from meta where k='schema'").fetchone()
+    if row and row[0] != str(_INDEX_SCHEMA):
+        con.execute("delete from rows_fts")
+        con.execute("delete from fingerprints")
+    con.execute("insert or replace into meta values ('schema', ?)", (str(_INDEX_SCHEMA),))
+    con.commit()
+    return con
+
+
+def _next_rowid(con):
+    """The next explicit rowid for rows_fts.
+
+    FTS5's implicit rowid is not reliably returned by cursor.lastrowid
+    after an INSERT, so the rowid we store could not be deleted -- and
+    the deletes were silently no-ops (a rebuild grew the table by
+    exactly the number of changed rows). So the rowid is explicit and
+    we keep the counter ourselves.
+
+    Deleted rowids go on a free list and are reused, so the counter does
+    not drift upward on every rebuild.
+    """
+    row = con.execute("select v from meta where k='free_rowids'").fetchone()
+    free = [int(x) for x in row[0].split(",") if x] if row and row[0] else []
+    if free:
+        rid = free.pop(0)
+        con.execute("insert or replace into meta values ('free_rowids', ?)",
+                    (",".join(str(x) for x in free),))
+        return rid
+    row = con.execute("select v from meta where k='next_rowid'").fetchone()
+    n = int(row[0]) if row else 1
+    con.execute("insert or replace into meta values ('next_rowid', ?)", (str(n + 1),))
+    return n
+
+
+def _free_rowid(con, rid):
+    """Return a deleted rowid to the free list."""
+    row = con.execute("select v from meta where k='free_rowids'").fetchone()
+    free = [int(x) for x in row[0].split(",") if x] if row and row[0] else []
+    if rid not in free:
+        free.append(rid)
+    con.execute("insert or replace into meta values ('free_rowids', ?)",
+                (",".join(str(x) for x in free),))
+
+
+def _row_fp(r):
+    """A fingerprint of a row's text. Cheap, stable, and enough to tell
+    'this row changed' from 'this row is the same'."""
+    import hashlib
+    h = hashlib.sha1()
+    h.update(str(r.get("content") or "").encode("utf-8", "replace"))
+    h.update(b"\x00")
+    h.update(str(r.get("role") or "").encode("utf-8", "replace"))
+    h.update(b"\x00")
+    h.update(str(r.get("kind") or "").encode("utf-8", "replace"))
+    return h.hexdigest()[:16]
+
+
+def _index_rebuild(a, force=False, quiet=False):
+    """(Re)build the index incrementally.
+
+    A row is re-indexed only when its fingerprint changed. A session whose
+    rows are all unchanged is skipped entirely, so re-indexing an unchanged
+    corpus costs a fingerprint pass, not a re-parse of every session.
+
+    force=True throws the index away and starts over.
+    """
+    con = _index_connect(create=True)
+    try:
+        if force:
+            con.execute("delete from rows_fts")
+            con.execute("delete from fingerprints")
+            con.commit()
+        # what is already indexed, keyed by (harness, sid) -> {seq: (fp, rowid)}
+        old = {}
+        for h, s, q, fp, rid, ep in con.execute(
+                "select harness, sid, seq, fp, rowid, epoch from fingerprints"):
+            old.setdefault((h, s), {})[q] = (fp, rid)
+
+        n_new = 0
+        n_changed = 0
+        n_removed = 0
+        n_sess = 0
+        n_skipped = 0
+        seen_sessions = set()
+        for harness in ("hermes", "opencode", "cline", "codex", "agy", "omp", "pi"):
+            sids = _all_session_ids(harness)
+            if not sids:
+                continue
+            for sid in sids:
+                try:
+                    rows, _info = _load_rows(harness, sid, _NoFilter())
+                except Exception:
+                    continue
+                if not rows:
+                    continue
+                n_sess += 1
+                seen_sessions.add((harness, sid))
+                prev = old.get((harness, sid), {})
+                cur = {}
+                for r in rows:
+                    seq = r.get("seq")
+                    fp = _row_fp(r)
+                    cur[seq] = fp
+                    was = prev.get(seq)
+                    if was and was[0] == fp:
+                        continue          # unchanged -- keep the indexed row
+                    if was:
+                        # changed: FTS5 rows cannot be updated in place.
+                        # The rowid is explicit (see _next_rowid), so this
+                        # delete actually removes the old row.
+                        con.execute("delete from rows_fts where rowid=?", (was[1],))
+                        _free_rowid(con, was[1])
+                        n_changed += 1
+                    body = str(r.get("content") or "")
+                    # the reasoning is content too -- the cline adapter
+                    # puts a lot of text there (115 rows in one
+                    # session), and an index that skipped it would not
+                    # cover what the tool can show.
+                    reason = str(r.get("reasoning") or "")
+                    if reason:
+                        body = (body + "\n" + reason) if body else reason
+                    # the index stores the REDACTED text -- the index file
+                    # lives in the cache dir and must not become a
+                    # plaintext copy of every session.
+                    # safety_redact returns (text, {kind: count}).
+                    body = safety_redact(body)[0]
+                    rid = _next_rowid(con)
+                    epoch = r.get("epoch")
+                    con.execute(
+                        "insert into rows_fts(rowid, harness, sid, role, kind, body, epoch) "
+                        "values (?,?,?,?,?,?,?)",
+                        (rid, harness, sid, r.get("role") or "",
+                         r.get("kind") or "", body, epoch))
+                    con.execute("insert or replace into fingerprints values (?,?,?,?,?,?)",
+                                (harness, sid, seq, fp, rid, epoch))
+                    prev[seq] = (fp, rid)
+                    n_new += 1
+                # rows that disappeared from the source
+                for seq, (fp, rid) in list(prev.items()):
+                    if seq not in cur:
+                        con.execute("delete from rows_fts where rowid=?", (rid,))
+                        _free_rowid(con, rid)
+                        con.execute("delete from fingerprints where harness=? and sid=? and seq=?",
+                                    (harness, sid, seq))
+                        n_removed += 1
+                if not quiet and (n_new or n_changed):
+                    print(f"  {harness}/{sid}: {len(rows)} rows", file=sys.stderr)
+        # sessions that no longer exist at all
+        for (h, s), rows_map in old.items():
+            if (h, s) not in seen_sessions:
+                for seq, (fp, rid) in rows_map.items():
+                    con.execute("delete from rows_fts where rowid=?", (rid,))
+                    _free_rowid(con, rid)
+                con.execute("delete from fingerprints where harness=? and sid=?", (h, s))
+                n_removed += 1
+        con.execute("insert or replace into meta values ('built', ?)",
+                    (str(int(time.time())),))
+        # A LIMITED index is INCOMPLETE: it does not cover every session,
+        # so a search answered from it would silently lose results. Mark
+        # it, and the search falls back to the scan.
+        complete = "0" if _index_limit() else "1"
+        con.execute("insert or replace into meta values ('complete', ?)",
+                    (complete,))
+        con.execute("insert or replace into meta values ('corpus', ?)",
+                    (_corpus_fingerprint(),))
+        con.commit()
+        total = con.execute("select count(*) from rows_fts").fetchone()[0]
+        if not quiet:
+            print(f"index: {total} rows from {n_sess} sessions "
+                  f"(+{n_new} new, ~{n_changed} changed, -{n_removed} removed) "
+                  f"-> {path_short(_index_path())}", file=sys.stderr)
+        return total, n_sess
+    finally:
+        con.close()
+
+
+def path_short(p):
+    home = os.path.expanduser("~")
+    return p.replace(home, "~", 1) if p.startswith(home) else p
+
+
+def _index_search(term, limit=40):
+    """Search the index. Returns [(harness, sid, role, kind, snippet)] or
+    None if the index is not usable."""
+    con = _index_connect(create=False)
+    if con is None:
+        return None
+    try:
+        # quote the term so punctuation cannot break the FTS parser, and
+        # add a prefix wildcard so "audit" also finds "auditing".
+        # The result is a SUPERSET -- the caller verifies each candidate
+        # against the source with a substring test.
+        q = '"' + term.replace('"', '""') + '"*'
+        rows = con.execute(
+            "select harness, sid, role, kind, snippet(rows_fts, 4, '', '', '...', 12) "
+            "from rows_fts where rows_fts match ? order by rank limit ?",
+            (q, limit)).fetchall()
+        return rows
+    except sqlite3.OperationalError:
+        # a malformed FTS query -- let the caller fall back to the scan
+        return None
+    finally:
+        con.close()
+
+
+def _index_status():
+    path = _index_path()
+    if not os.path.exists(path):
+        print("index: not built (search falls back to a linear scan)")
+        return
+    con = _index_connect(create=False)
+    try:
+        n = con.execute("select count(*) from rows_fts").fetchone()[0]
+        built = con.execute("select v from meta where k='built'").fetchone()
+        size = os.path.getsize(path)
+        age = ""
+        if built:
+            secs = int(time.time()) - int(built[0])
+            age = f", built {secs // 60} min ago"
+        lim = _index_limit()
+        lims = f", limit {lim}/harness" if lim else ""
+        comp = con.execute("select v from meta where k='complete'").fetchone()
+        corp = con.execute("select v from meta where k='corpus'").fetchone()
+        if not (comp and comp[0] == "1"):
+            state = "INCOMPLETE -- searches use the linear scan"
+        elif not corp or corp[0] != _corpus_fingerprint():
+            state = "built from a DIFFERENT corpus -- searches use the linear scan"
+        else:
+            state = "complete"
+        print(f"index: {n:,} rows, {size / 1e6:.1f} MB{age}{lims} -> {path_short(path)}")
+        print(f"        {state}")
+    finally:
+        con.close()
+
+
+# ---------------------------------------------------------------- indexing
+def _corpus_fingerprint():
+    """A fingerprint of the corpus the index would be built from.
+
+    The harness data roots. If they change -- a different Hermes db, a
+    fixture directory -- the index does not describe the corpus being
+    searched, so it must not be used.
+    """
+    import hashlib
+    parts = []
+    for name in ("HB", "ODB", "CLINEDB", "CODEX_DIR", "AGY_BRAIN", "AGY_DIR"):
+        v = globals().get(name)
+        if v:
+            parts.append(f"{name}={v}")
+    for name, root in _OMP_ROOTS:
+        parts.append(f"{name}={root}")
+    return hashlib.sha1("|".join(sorted(parts)).encode()).hexdigest()[:16]
+
+
+def _index_limit():
+    """Max sessions to index per harness. None = no limit."""
+    v = os.environ.get("STM_INDEX_LIMIT")
+    if v:
+        try:
+            n = int(v)
+            return n if n > 0 else None
+        except ValueError:
+            return None
+    return getattr(_INDEX_LIMIT, "n", None)
+
+
+def _all_session_ids(harness):
+    """Every session id for a harness, without printing anything.
+
+    The list functions print; the index needs the ids. This mirrors their
+    sources so the index covers exactly what --list shows.
+    """
+    ids = []
+    try:
+        if harness == "hermes":
+            db = ro(HB)
+            ids = [r[0] for r in db.execute("select id from sessions").fetchall()]
+        elif harness == "opencode":
+            db = ro(ODB)
+            cols = [c[1] for c in db.execute("pragma table_info(session)")]
+            if "id" in cols:
+                ids = [r[0] for r in db.execute("select id from session").fetchall()]
+        elif harness == "cline":
+            db = ro(CLINEDB)
+            ids = [r[0] for r in db.execute("select session_id from sessions").fetchall()]
+        elif harness == "codex":
+            # codex's id is session_meta.session_id (the trailing uuid),
+            # NOT the filename -- --list prints the uuid, so the index
+            # must too or its @session: markers are not usable.
+            for f in _codex_all_files():
+                if not os.path.isfile(f):
+                    continue
+                sid = None
+                try:
+                    with open(f, encoding="utf-8") as fh:
+                        for ln in fh:
+                            ln = ln.strip()
+                            if not ln:
+                                continue
+                            try:
+                                o = json.loads(ln)
+                            except Exception:
+                                continue
+                            if o.get("type") == "session_meta":
+                                sid = (o.get("payload") or {}).get("session_id")
+                                if sid:
+                                    break
+                except OSError:
+                    continue
+                ids.append(sid or os.path.basename(f))
+        elif harness == "agy":
+            for bd in glob.glob(os.path.join(AGY_BRAIN, "*")):
+                if os.path.isdir(bd):
+                    ids.append(os.path.basename(bd))
+        elif harness in ("omp", "pi"):
+            for _mt, sid, _path, h, _sz, _slug in omp_list_sessions(harness, None):
+                ids.append(sid)
+    except Exception:
+        return []
+    ids = [i for i in ids if i]
+    lim = _index_limit()
+    if lim and len(ids) > lim:
+        ids = ids[-lim:]
+    return ids
+
+
+def _index_usable():
+    """Is the index present, populated and COMPLETE?
+
+    A limited index (built with --index-limit) covers only some of the
+    corpus, so a search answered from it would silently LOSE results.
+    That is the one thing an index must never do, so an incomplete index
+    is not used and the linear scan runs instead.
+    """
+    if os.environ.get("STM_NO_INDEX"):
+        return False
+    path = _index_path()
+    if not os.path.exists(path):
+        return False
+    try:
+        con = _index_connect(create=False)
+        if con is None:
+            return False
+        try:
+            n = con.execute("select count(*) from rows_fts").fetchone()[0]
+            if n <= 0:
+                return False
+            row = con.execute("select v from meta where k='complete'").fetchone()
+            if row is not None and row[0] != "1":
+                return False      # incomplete -- the scan is authoritative
+            # and it must describe THIS corpus
+            row = con.execute("select v from meta where k='corpus'").fetchone()
+            if row is None or row[0] != _corpus_fingerprint():
+                return False      # built from a different corpus
+            return True
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return False
+
+
+def _do_indexed_search(term, only=None):
+    """Search via the FTS5 index, then VERIFY against the source.
+
+    FTS5 finds candidate sessions; each one is loaded and checked with
+    the same substring test the linear scan uses, so the hit set is
+    identical. The index can only make the search faster -- never
+    change what it finds.
+    """
+    res = _index_search(term, limit=400)
+    if res is None:
+        # invalid FTS query -- use the old path
+        _do_search_scan(term, only)
+        return
+    if not res:
+        print(f"no matches for {term!r}")
+        return
+
+    # 1. candidate sessions from the FTS5 match
+    cands = []
+    seen = set()
+    for harness, sid, role, kind, snip in res:
+        if only and harness != only:
+            continue
+        if (harness, sid) in seen:
+            continue
+        seen.add((harness, sid))
+        cands.append((harness, sid))
+
+    # 2. the authoritative substring check, run INSIDE the index.
+    #    FTS5 tokenizes, the scan does substring matching, so the token
+    #    match is only a superset; this LIKE is what decides.
+    hits_by_sess = {}
+    con = _index_connect(create=False)
+    if con is None:
+        _do_search_scan(term, only)
+        return
+    try:
+        needle = "%" + term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+        # ONE global LIKE over the index, not one per candidate session:
+        # each per-session LIKE was a full scan of the FTS content table
+        # (measured: 37 candidates cost 3.9s, one global LIKE costs 0.1s).
+        #
+        # Only a WINDOW around the term is fetched, never the whole body:
+        # pulling 2000 full rows was what made the indexed path slower
+        # than the scan (7.7s vs 1.3s).
+        rows = con.execute(
+            "select harness, sid, role, kind, epoch, "
+            "  substr(body, max(1, instr(lower(body), lower(?)) - 60), 160) "
+            "from rows_fts where body like ? escape '\\' "
+            "order by epoch desc limit 2000",
+            (term, needle)).fetchall()
+        for h, s, role, kind, epoch, body in rows:
+            if only and h != only:
+                continue
+            hits_by_sess.setdefault((h, s), []).append((role, kind, body, epoch))
+    finally:
+        con.close()
+
+    if not hits_by_sess:
+        # the index found nothing -- the scan is authoritative, and a
+        # search that says "no matches" when the scan would find some
+        # is a search that lost a result.
+        _do_search_scan(term, only)
+        return
+    print(f"## -- search {term!r} (fts5 index) --")
+    # every session with a hit is listed -- capping the LIST hid real
+    # matches. The per-session detail lines are capped separately so a
+    # common term does not print a thousand snippets.
+    n_detail = 20
+    # newest session first, like the linear scan orders by recency
+    ordered = sorted(hits_by_sess.items(),
+                     key=lambda kv: max((h[3] or 0) for h in kv[1]), reverse=True)
+    for k, ((harness, sid), hits) in enumerate(ordered):
+        print(f"{sid} | {harness} | {len(hits)} match(es) | @session:{harness}/{sid}")
+        if k >= n_detail:
+            continue
+        for role, kind, body, _epoch in hits[:3]:
+            body = (body or "").replace("\n", " ")
+            i = body.lower().find(term.lower())
+            lo = max(0, i - 60)
+            snip = ("..." if lo else "") + body[lo:i + 100] + ("..." if i + 100 < len(body) else "")
+            print(f"    [{role:9}] {kind:12} {snip[:160]}")
+
+
+def _do_search_scan(term, only=None):
+    """The original linear scan.
+
+    It calls the per-harness search functions DIRECTLY, not _do_search --
+    _do_search routes to the index, and the index's fallback calls this
+    function, so going through _do_search recursed forever.
+    """
+    if only:
+        if only == "hermes": hermes_search(term)
+        elif only == "opencode": opencode_search(term)
+        elif only == "cline": cline_search(term)
+        elif only == "codex": codex_search(term)
+        elif only == "agy": agy_search(term)
+        elif only in ("omp", "pi"): omp_print_search(term, only)
+        return
+    for h in HARNESSES:
+        print(f"## -- search {term!r} in {h} --")
+        try:
+            if h == "hermes": hermes_search(term)
+            elif h == "opencode": opencode_search(term)
+            elif h == "cline": cline_search(term)
+            elif h == "codex": codex_search(term)
+            elif h == "agy": agy_search(term)
+            elif h in ("omp", "pi"): omp_print_search(term, h)
+        except Exception as e:
+            _notice(f"(search in {h} failed: {e})")
+    _notice("[agy: protobuf step_payload not searched; brain transcripts are searched]")
+
+
 def main():
-    global _REDACT, _FENCE
+    global _REDACT, _FENCE, _INDEX_LIMIT
     ap = argparse.ArgumentParser(description="Universal AI conversation inspector.")
     ap.add_argument("harness", choices=HARNESSES + ["all"])
     ap.add_argument("--list", type=int, nargs="?", const=20)
@@ -2864,6 +3417,14 @@ def main():
     ap.add_argument("--out", metavar="FILE")
     ap.add_argument("--format", choices=["md","jsonl","json","txt"], default="jsonl")
     ap.add_argument("--peek")
+    ap.add_argument("--reindex", action="store_true",
+                    help="update the local FTS5 search index (incremental)")
+    ap.add_argument("--reindex-force", action="store_true",
+                    help="rebuild the local FTS5 search index from scratch")
+    ap.add_argument("--index-limit", type=int, default=None, metavar="N",
+                    help="index at most N sessions per harness (default: all)")
+    ap.add_argument("--index-status", action="store_true",
+                    help="what is in the local search index")
     ap.add_argument("--summary", metavar="ID",
                     help="session shape, token footprint and tool usage, "
                          "without reading the transcript")
@@ -2904,6 +3465,8 @@ def main():
     ap.add_argument("--clip", type=int, metavar="N", help="truncate display body to N chars (explicit marker)")
     a = ap.parse_args()
     if a.redact is not None: _REDACT = a.redact
+    if getattr(a, "index_limit", None) is not None:
+        _INDEX_LIMIT = a.index_limit
     _install_cleanup_handlers()
     if getattr(a, "budget", None) is not None and a.budget <= 0:
         global _BUDGET
@@ -2916,6 +3479,12 @@ def main():
             agy_logs(a.logs)
         elif a.list is not None or a.recent is not None:
             _do_list(a.harness, a.list if a.list is not None else a.recent, a)
+        elif a.reindex:
+            _index_rebuild(a, force=False)
+        elif a.reindex_force:
+            _index_rebuild(a, force=True)
+        elif a.index_status:
+            _index_status()
         elif a.search:
             _do_search(a.harness, a.search, filt)
         elif a.peek:

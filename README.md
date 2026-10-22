@@ -130,6 +130,27 @@ It skips Hermes' own compaction notices when it looks for what you actually aske
 finds the tool calls that never got a result, and keeps the tail inside a token budget
 so the new session does not die the same way.
 
+To see a session's shape without reading it:
+
+```bash
+python3 scripts/sessions.py hermes --summary <ID>      # ~1.5 KB instead of 2.8 MB
+python3 scripts/sessions.py hermes --diff <ID_A> <ID_B> # what changed between two
+```
+
+`--summary` gives you the row breakdown, the tool-usage histogram, the token footprint and
+the fidelity verdict. `--diff` gives you the structural delta, the tools called in both but
+with different arguments, and where the human's intent diverged.
+
+And if you search a lot, build the index once:
+
+```bash
+python3 scripts/sessions.py all --reindex     # 8.8s search -> 0.55s
+python3 scripts/sessions.py all --index-status
+```
+
+It lives in your cache dir, stores only *redacted* text, and is rebuilt incrementally.
+Delete it whenever — the search falls back to the old scan.
+
 <br/>
 
 ## ◈ it will not make stuff up

@@ -954,6 +954,125 @@ def main():
                   bool(_sids) and _sids[0] == "fixture0001",
                   f"first={_sids[0] if _sids else None}")
 
+    # ---- external-audit regressions ---------------------------------
+    # Each of these was a real defect found by an external audit and
+    # reproduced here. They stay so they cannot come back.
+    import sqlite3 as _sq2
+    import tempfile as _tf3
+
+    def _hermes_db(rows_):
+        _d = _tf3.mkdtemp()
+        _p = os.path.join(_d, "h.db")
+        _c = _sq2.connect(_p)
+        _c.execute("""create table sessions(id text, title text, source text,
+                     created_at integer, model text, billing_provider text,
+                     started_at integer, ended_at integer)""")
+        _c.execute("insert into sessions values ('s1','t','hermes',1700000000,'m','v',1700000000,1700000100)")
+        _c.execute("""create table messages(session_id text, role text, timestamp integer,
+                     content text, reasoning_content text, tool_calls text,
+                     api_content text, finish_reason text, tool_name text,
+                     effect_disposition text, compacted integer default 0,
+                     active integer default 1, _compressed_summary integer default 0)""")
+        for _r in rows_:
+            _c.execute("insert into messages values (?,?,?,?,?,?,?,?,?,?,0,1,0)", _r)
+        _c.commit(); _c.close()
+        return _p
+
+    def _run_env(args, env):
+        e = dict(os.environ)
+        e.update(env)
+        return subprocess.run([PY, S, *args], capture_output=True, text=True,
+                              env=e, timeout=300)
+
+    def _hermes_json(rows_, *args):
+        _p = _hermes_db(rows_)
+        _o = _run_env(["hermes", "--json", "s1", *args], {"STM_HERMES_DB": _p})
+        try:
+            return json.loads(_o.stdout)
+        except Exception:
+            return {}
+
+    _tc = json.dumps([{"id": "call_x", "type": "function",
+                "function": {"name": "bash", "arguments": '{"cmd":"ls -la"}'}}])
+
+    _j1 = _hermes_json([("s1", "system", 1700000001, "SYSTEM RULES", None, None, None, None, None, None)])
+    _roles = [m.get("role") for m in (_j1.get("messages") or [])]
+    check("audit: hermes role=system is not rendered as user",
+          "system" in _roles and "user" not in _roles, str(_roles))
+
+    _j2 = _hermes_json([("s1", "assistant", 1700000001, "Let me check", None, _tc, None, None, None, None)])
+    _joined = " ".join(str(m.get("content") or "") for m in (_j2.get("messages") or []))
+    check("audit: a text+tool_call turn keeps the call's arguments",
+          "ls -la" in _joined or "arguments" in _joined, "args lost")
+
+    _pk = run("hermes", "--peek", "NO_SUCH_SESSION_AT_ALL")
+    check("audit: --peek does not claim 'complete' for a nonexistent id",
+          "complete" not in _pk.stdout.lower(), _pk.stdout[:100])
+
+    # the documented synthetic test secret (the CI scanner allowlists it)
+    _sec = "ghp_EXAMPLEKEYFORTESTSONLY0123456789"
+    _p3 = _hermes_db([("s1", "user", 1700000001, f"the key is {_sec} ok", None, None, None, None, None, None)])
+    _pk2 = _run_env(["hermes", "--peek", "s1"], {"STM_HERMES_DB": _p3})
+    check("audit: --peek output is redacted", _sec not in _pk2.stdout, "secret in --peek")
+    _sr = _run_env(["hermes", "--search", "key"], {"STM_HERMES_DB": _p3})
+    check("audit: --search output is redacted", _sec not in _sr.stdout, "secret in --search")
+
+    for _label, _payload, _secret in (
+            ("JSON-quoted password", '{"password": "hunter2hunter2"}', "hunter2hunter2"),
+            ("refresh_token", 'refresh_token = "abcdef1234567890abcdef"', "abcdef1234567890abcdef"),
+            ("db_password", "db_password: sup3rs3cretvalue", "sup3rs3cretvalue"),
+            ("lowercase aws secret", "aws_secret_access_key = wJalrXUtnFEMI/K7MDENG", "wJalrXUtnFEMI"),
+            ("Authorization Basic", "Authorization: Basic dXNlcjpwYXNzd29yZDEyMw==", "dXNlcjpwYXNzd29yZDEyMw=="),
+            ("sk-proj-", "sk-proj-abcdefghijklmnopqrstuvwxyz1234", "abcdefghijklmnopqrstuvwxyz1234"),
+            ("unterminated PEM", "-" * 5 + "BEGIN PRIVATE KEY" + "-" * 5
+             + "\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC", "MIIEvQIBADANBgkqhkiG9w0BAQEFAASC")):
+        _p4 = _hermes_db([("s1", "user", 1700000001, _payload, None, None, None, None, None, None)])
+        _out4 = _run_env(["hermes", "--json", "s1"], {"STM_HERMES_DB": _p4}).stdout
+        check(f"audit: redaction catches {_label}", _secret not in _out4, "secret survived")
+
+    _p5 = _hermes_db([("s1", "tool", 1700000001, "X" * 3_000_000, None, None, None, None, None, None)])
+    _tr = _run_env(["hermes", "--transcript", "s1"], {"STM_HERMES_DB": _p5})
+    check("audit: the budget does not print a 3MB tool output whole",
+          len(_tr.stdout) < 1_500_000, f"{len(_tr.stdout)} chars")
+    _md = _run_env(["hermes", "--md", "s1"], {"STM_HERMES_DB": _p5})
+    check("audit: --md announces its truncation",
+          "truncat" in _md.stdout.lower() or "budget" in _md.stdout.lower(),
+          f"{len(_md.stdout)} chars")
+
+    _d6 = _tf3.mkdtemp()
+    _out6 = os.path.join(_d6, "o.jsonl")
+    _run_env(["hermes", "--export", "s1", "--out", _out6], {"STM_HERMES_DB": _p3})
+    if os.path.exists(_out6):
+        check("audit: --export writes the file 0600",
+              oct(os.stat(_out6).st_mode & 0o777) == "0o600",
+              oct(os.stat(_out6).st_mode & 0o777))
+        _first = open(_out6, encoding="utf-8").readline()
+        check("audit: --export produces valid JSONL",
+              _first.lstrip().startswith("{"), f"first line: {_first[:40]!r}")
+    else:
+        check("audit: --export writes the file 0600", False, "no file")
+        check("audit: --export produces valid JSONL", False, "no file")
+
+    for _mode in ("--md", "--tail", "--preview"):
+        _args = ["hermes", _mode] + (["s1", "5"] if _mode in ("--tail", "--preview") else ["s1"])
+        _o7 = _run_env(_args, {"STM_HERMES_DB": _p3})
+        check(f"audit: {_mode} output is fenced as untrusted",
+              "UNTRUSTED CONTENT" in _o7.stdout, "no fence")
+    for _mode in ("--json", "--jsonl"):
+        _o8 = _run_env(["hermes", _mode, "s1"], {"STM_HERMES_DB": _p3})
+        check(f"audit: {_mode} output is fenced as untrusted",
+              ("UNTRUSTED CONTENT" in _o8.stdout or
+               "UNTRUSTED CONTENT" in _o8.stderr or
+               '"untrusted_content"' in _o8.stdout), "no fence at all")
+
+    check("audit: --raw is not a CLI flag",
+          "--raw" not in run("hermes", "--help").stdout, "--raw exists")
+
+    _j9 = _hermes_json([("s1", "assistant", 1700000001, None, None, _tc, None, None, None, "bash")])
+    _un9 = " ".join(str(u) for u in ((_j9.get("session") or {}).get("fidelity") or {}).get("unrecovered") or [])
+    check("audit: a dangling tool call is reported",
+          "no result" in _un9, _un9[:80])
+
     # cross-harness
     check("all --list exits 0", run("all","--list").returncode == 0)
     check("all --search exits 0", run("all","--search","the").returncode == 0)

@@ -660,7 +660,9 @@ def main():
                        tool_name text, effect_disposition text,
                        compacted integer default 0, active integer default 1,
                        _compressed_summary integer default 0)""")
-        _SEC = "sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ012345"
+        # the same SYNTHETIC secret shape the other redaction test uses
+        # (documented as safe in the CI scanner's allowlist)
+        _SEC = "sk-EXAMPLEKEYFORTESTSONLY6789"
         _c.execute("insert into messages values ('s1','user',1700000000,?,null,"
                    "null,null,null,null,null,0,1,0)", (f"key is {_SEC} do it",))
         _c.execute("insert into messages values ('s1','tool',1700000002,?,null,"

@@ -69,6 +69,10 @@ HARNESSES = ["hermes", "opencode", "cline", "codex", "agy", "omp", "pi"]
 _BUDGET = 120000      # max chars of body to print; None disables
 _REDACT = True
 _FENCE = True
+# --source is a hermes column, not a cross-harness concept. It lives here so
+# session resolution can honour it without threading a param through every
+# call site; None means "whatever the default list view shows" (cron excluded).
+_SOURCE = None
 _REDACT_COUNTS = {}
 
 def ro(path):
@@ -3896,7 +3900,15 @@ def _get_latest_session(harness):
     try:
         if harness == "hermes":
             db = ro(HB)
-            row = db.execute("select id, started_at from sessions order by started_at desc limit 1").fetchone()
+            # mirror hermes_list's source semantics so `last` agrees with `ls`:
+            # unset -> hide cron, "all" -> show everything, else exact match.
+            if _SOURCE == "all":
+                row = db.execute("select id, started_at from sessions order by started_at desc limit 1").fetchone()
+            elif _SOURCE:
+                row = db.execute("select id, started_at from sessions where source=? order by started_at desc limit 1",
+                                 (_SOURCE,)).fetchone()
+            else:
+                row = db.execute("select id, started_at from sessions where source!='cron' order by started_at desc limit 1").fetchone()
             if row:
                 epoch = to_epoch(row[1]) or 0
                 return (epoch, row[0], "hermes")
@@ -4087,11 +4099,18 @@ def _resolve_session(tool, sid):
         print(f"error: '{sid}' is ambiguous ({len(hits)} matches):\n" + "\n".join(lines) + more, file=sys.stderr)
         sys.exit(2)
 
-    return (tool if tool != "all" else "hermes"), sid
+    # Nothing matched, exactly or by prefix. Returning the raw sid here used to
+    # fall through and print a phantom session (and exit 0), so scripts could
+    # not tell a bad id from a good one. Fail loudly instead.
+    _shown = sid if len(sid) <= 64 else sid[:61] + "..."
+    scope = "" if tool in (None, "", "all") else f" in {tool}"
+    print(f"error: no session matching '{_shown}'{scope}; try stm ls, or pass a longer prefix",
+          file=sys.stderr)
+    sys.exit(2)
 
 
 def main():
-    global _REDACT, _FENCE, _INDEX_LIMIT
+    global _REDACT, _FENCE, _INDEX_LIMIT, _SOURCE
     ap = argparse.ArgumentParser(
         prog="stm",
         description="Universal AI conversation inspector across coding agents.",
@@ -4195,6 +4214,8 @@ harnesses:
     rewritten_args = _rewrite_human_argv(raw_args)
     a = ap.parse_args(rewritten_args)
     if a.redact is not None: _REDACT = a.redact
+    # make --source visible to session resolution, not just to the list view
+    _SOURCE = a.source
     if getattr(a, "index_limit", None) is not None:
         _INDEX_LIMIT = a.index_limit
     _install_cleanup_handlers()

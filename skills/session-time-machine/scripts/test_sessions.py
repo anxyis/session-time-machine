@@ -1075,6 +1075,72 @@ def main():
     _pk = run("hermes", "--peek", "NO_SUCH_SESSION_AT_ALL")
     check("audit: --peek does not claim 'complete' for a nonexistent id",
           "complete" not in _pk.stdout.lower(), _pk.stdout[:100])
+    check("audit: --peek exits non-zero for a nonexistent id",
+          _pk.returncode != 0 and "no session matching" in _pk.stderr,
+          f"rc={_pk.returncode} err={_pk.stderr[:80]}")
+    # every id-taking verb must fail loudly, not print a phantom session
+    for _verb, _argc in (("peek", 1), ("summary", 1), ("handoff", 1), ("tail", 1),
+                         ("transcript", 1), ("preview", 1), ("md", 1),
+                         ("jsonl", 1), ("json", 1), ("export", 1)):
+        _rv = run("all", "--" + _verb, "NO_SUCH_SESSION_AT_ALL")
+        check(f"audit: --{_verb} exits non-zero for a nonexistent id",
+              _rv.returncode == 2 and _rv.stdout == "",
+              f"rc={_rv.returncode} out={_rv.stdout[:60]!r}")
+    _rd = run("all", "--diff", "NO_SUCH_SESSION_AT_ALL", "s1")
+    check("audit: --diff exits non-zero when either id is bogus",
+          _rd.returncode == 2, f"rc={_rd.returncode}")
+    _rpath = run("all", "--path", "NO_SUCH_SESSION_AT_ALL")
+    check("audit: --path exits non-zero for a nonexistent id",
+          _rpath.returncode == 2 and _rpath.stdout == "", f"rc={_rpath.returncode}")
+    # a scoped harness must say which scope it searched
+    _rsc = run("codex", "--peek", "NO_SUCH_SESSION_AT_ALL")
+    check("audit: scoped miss names the harness in the error",
+          "in codex" in _rsc.stderr, _rsc.stderr[:100])
+
+    # ---- 'last' must honour --source, and agree with 'ls' ----------------
+    # Deterministic corpus: a NEWER cron session and an OLDER cli session.
+    # Before the fix, `last` ignored --source entirely and always returned
+    # the cron row, so `--source cli last` handed back an excluded session.
+    def _src_db():
+        _d = _tf3.mkdtemp()
+        _p = os.path.join(_d, "h.db")
+        _c = _sq2.connect(_p)
+        _c.execute("""create table sessions(id text, title text, source text,
+                     created_at integer, model text, billing_provider text,
+                     started_at integer, ended_at integer)""")
+        _c.execute("""create table messages(session_id text, role text, timestamp integer,
+                     content text, reasoning_content text, tool_calls text,
+                     api_content text, finish_reason text, tool_name text,
+                     effect_disposition text, compacted integer default 0,
+                     active integer default 1, _compressed_summary integer default 0)""")
+        # cron_one is the NEWEST by started_at
+        _c.execute("insert into sessions values ('cron_one','c','cron',1700000200,'m','v',1700000200,1700000260)")
+        _c.execute("insert into sessions values ('cli_one','c','cli',1700000100,'m','v',1700000100,1700000160)")
+        _c.execute("insert into messages values ('cron_one','user',1700000200,'cron body',NULL,NULL,NULL,NULL,NULL,NULL,0,1,0)")
+        _c.execute("insert into messages values ('cli_one','user',1700000100,'cli body',NULL,NULL,NULL,NULL,NULL,NULL,0,1,0)")
+        _c.commit(); _c.close()
+        return _p
+
+    _sdb = dict(STM_HERMES_DB=_src_db())
+    _last_pick = {}
+    for _lbl, _extra in (("unset", []), ("cron", ["--source", "cron"]),
+                         ("cli", ["--source", "cli"]), ("all", ["--source", "all"]),
+                         ("telegram", ["--source", "telegram"])):
+        _rp = _run_env(["hermes", "--peek", "last"] + _extra, _sdb)
+        _m = re.search(r"## peek (\S+)", _rp.stdout)
+        _last_pick[_lbl] = _m.group(1) if _m else None
+    check("cli: last ignores cron by default (matches ls)",
+          _last_pick["unset"] == "cli_one", _last_pick["unset"])
+    check("cli: last --source cron picks the cron session",
+          _last_pick["cron"] == "cron_one", _last_pick["cron"])
+    check("cli: last --source cli excludes the newer cron session",
+          _last_pick["cli"] == "cli_one", _last_pick["cli"])
+    check("cli: last --source all picks the newest overall",
+          _last_pick["all"] == "cron_one", _last_pick["all"])
+    check("cli: last --source telegram finds nothing and exits non-zero",
+          _last_pick["telegram"] is None and
+          _run_env(["hermes", "--peek", "last", "--source", "telegram"], _sdb).returncode == 2,
+          str(_last_pick["telegram"]))
 
     # the documented synthetic test secret (the CI scanner allowlists it)
     _sec = "ghp_EXAMPLEKEYFORTESTSONLY0123456789"
@@ -1202,9 +1268,18 @@ def main():
             _ambig = True
         check("cli: ambiguous prefix raises SystemExit", _ambig)
 
-        # explicit tool scoping does not leak to another harness
-        _h_scoped, _ = sessions._resolve_session("hermes", "01a_un")
-        check("cli: explicit harness scope does not leak", _h_scoped == "hermes")
+        # explicit tool scoping does not leak to another harness. The old
+        # contract silently fell through and returned the requested harness
+        # for an id that does not exist, which printed a phantom session and
+        # exited 0. A scoped miss must now fail loudly.
+        _scoped_leak = None
+        try:
+            _h_scoped, _ = sessions._resolve_session("hermes", "01a_un")
+            _scoped_leak = _h_scoped
+        except SystemExit:
+            pass
+        check("cli: explicit harness scope does not leak",
+              _scoped_leak is None, f"fell through to {_scoped_leak!r}")
 
         # adversarial ids do not crash with unhandled exception
         for _bad in ("../../etc/passwd", "hermes/../../x", "a\x00b", "x" * 5000, "s1; rm -rf ~"):

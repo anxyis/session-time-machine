@@ -44,6 +44,15 @@ An assistant turn that invoked tools has `content==null` (its payload is the too
 
   This matters when reading a long session: a compacted session is **not** a straight-line conversation of what the model had in context. `--context live` shows only what the model currently sees; `--context compacted` shows only what it no longer sees. `--peek` prints the split.
 
+## Inspecting without reading (`--summary`, `--diff`)
+`--summary ID` prints the shape of a session: row count, content and reasoning size, a role/kind breakdown with percentages, the tool-usage histogram, the fidelity verdict, and the opening prompt plus the closing answer. It is computed from row metadata, so it never puts the transcript in your context. On the 2,898-row sample session the summary is ~1.5 KB against a 2.8M-char transcript.
+
+`--diff ID_A ID_B` compares two sessions of the same harness:
+- **STRUCTURE** — rows, kind breakdown, content chars, with deltas.
+- **TOOL USAGE** — every tool whose call count differs.
+- **MODIFIED TOOL CALLS** — the tools called in *both* sessions but with *different arguments*. The argument hash ignores the volatile call ids, so the same call with a new id is not a modification. (Grouping by tool, not by arghash: two different sessions almost never share an arghash, so listing those said nothing.)
+- **PROMPT DRIFT** — the human's own messages compared: whether the opening intent changed, and the first message where they diverged. Harness-injected rows are skipped, as in the handoff pack.
+
 ## The handoff pack (`--handoff`)
 When a session dies and you need to start a new one that knows what you were doing, `--handoff` builds one block of text to paste into the fresh session:
 
@@ -78,6 +87,10 @@ python3 $S <harness> --logs N          # agy run logs only
 Filters SELECT rows only — they never mutate a row, so a surviving row is identical with or without filters. Active filters are reported on stderr; stdout stays machine-parseable.
 ```
 --no-tools            drop tool_call/tool_output rows
+--summary ID          session shape, token footprint, tool usage --
+                      without reading the transcript
+--diff ID_A ID_B      compare two sessions: structure, modified tool
+                      calls, prompt drift
 --handoff ID          build a handoff pack: last intent, unfinished
                       tool calls, and a token-budgeted tail, ready to
                       seed a fresh session

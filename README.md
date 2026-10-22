@@ -301,19 +301,15 @@ developed and verified on Linux.
 
 ## ◈ what's in the works next? (o゜▽゜)o☆
 
-- **A `--diff` mode** — point it at two sessions and see what actually changed between
-  them. Right now you eyeball two transcripts and hope.
-- **A resume/handoff pack** — the last intent, the unfinished tool calls, and the
-  tail of the conversation, token-budgeted, ready to seed a fresh session. This is
-  the thing the tool actually exists for.
-- **Streaming/live tail** — follow a session as it's happening instead of after the fact.
-- **A `--summary` mode** that gives you the shape of a session (how many tool calls, what
-  got read, what it edited) without reading the whole thing.
 - **A local index** — right now `--search` is a linear scan of every session file.
   An incremental FTS5 cache would make it instant and give stable cross-harness
   session ids.
+- **Streaming/live tail** — follow a session as it's happening instead of after the fact.
 - **More harnesses** — Windsurf, Aider, Goose, and whatever else shows up with a weird
   enough storage format to be interesting.
+
+Already built, if you missed them: `--summary` (the shape of a session without reading it),
+`--diff` (two sessions compared), and `--handoff` (the pack you paste into a fresh session).
 
 <br/>
 

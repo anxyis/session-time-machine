@@ -2590,6 +2590,257 @@ def _handoff(tool, sid, a, filt):
 
 
 
+# ---------------------------------------------------------------- summary
+def _summary(tool, sid, a, filt):
+    """The shape of a session, without reading its transcript.
+
+    Everything here comes from row metadata (kind, role, tool names,
+    content lengths). The full text never has to enter anyone's context --
+    this is computed in-process and printed as a compact table.
+    """
+    rows, info = _load_rows(tool, sid, filt)
+    if not rows:
+        print(f"no rows for {tool}/{sid}", file=sys.stderr)
+        return
+
+    c = counts(rows)
+    fid = fidelity_report(rows, sid, tool)
+    ctx = fid.get("context") or {}
+    meta = info.get("meta") or info or {}
+
+    out = []
+    A = out.append
+    A(f"# SUMMARY - {tool} session {sid}")
+    A("")
+    A(f"- rows: {len(rows)}")
+    A(f"- content: ~{fid.get('content_chars', 0):,} chars "
+      f"(~{fid.get('content_chars', 0) // 4:,} tokens est.)")
+    A(f"- reasoning: ~{sum(len(r.get('reasoning') or '') for r in rows):,} chars")
+    A(f"- start: {meta.get('start', '?')}   end: {meta.get('end', '?')}")
+    A(f"- model: {meta.get('model') or '?'} via {meta.get('provider') or '?'}")
+    if any(ctx.values()):
+        A(f"- context: live={ctx.get('live', 0)} "
+          f"compacted-away={ctx.get('compacted', 0)} "
+          f"retained={ctx.get('retained', 0)}")
+    A("")
+
+    A("## SHAPE")
+    A("")
+    A("  role/kind                count")
+    total = len(rows) or 1
+    for label, key in (("user messages", "u"), ("assistant ok", "a_ok"),
+                       ("assistant tool calls", "a_tool"), ("tool outputs", "tool"),
+                       ("developer", "d"), ("reasoning", "reasoning"),
+                       ("empty", "empty"), ("lifecycle", "lifecycle"),
+                       ("errors", "error"), ("lost", "a_lost")):
+        v = c.get(key, 0)
+        if v:
+            A(f"  {label:24} {v:6}  {v * 100 // total:3}%")
+    A("")
+
+    A("## TOOL USAGE")
+    A("")
+    tc = {}
+    for r in rows:
+        for t in (r.get("tool_names") or []):
+            tc[t] = tc.get(t, 0) + 1
+    if tc:
+        top = sorted(tc.items(), key=lambda x: (-x[1], x[0]))
+        for t, n in top[:15]:
+            A(f"  {t:26} {n:5}")
+        if len(top) > 15:
+            A(f"  ... and {len(top) - 15} more tools")
+    else:
+        A("  (no tool calls)")
+    A("")
+
+    A("## FIDELITY")
+    A("")
+    A(f"  complete: {fid.get('complete')}")
+    unrec = fid.get("unrecovered") or []
+    if unrec:
+        A(f"  gaps: {len(unrec)}")
+        for u in unrec[:5]:
+            A(f"    - {str(u)[:120]}")
+        if len(unrec) > 5:
+            A(f"    ... and {len(unrec) - 5} more")
+    A("")
+
+    A("## OPENING AND CLOSING")
+    A("")
+    users = [r for r in rows if r.get("role") == "user" and not _is_injected(r)]
+    if not users:
+        users = [r for r in rows if r.get("role") == "user"]
+    if users:
+        A(f"  first user ({users[0]['ts']}):")
+        for ln in str(users[0].get("content") or "").strip().splitlines()[:4]:
+            A(f"    {clip(ln, 100)}")
+    else:
+        A("  first user: (none)")
+    answers = [r for r in rows if r.get("kind") == "message"
+               and r.get("role") == "assistant" and r.get("content")]
+    if answers:
+        A(f"  last assistant ({answers[-1]['ts']}):")
+        for ln in str(answers[-1].get("content") or "").strip().splitlines()[:4]:
+            A(f"    {clip(ln, 100)}")
+    else:
+        A("  last assistant: (none)")
+    A("")
+
+    print("\n".join(out))
+
+
+# ---------------------------------------------------------------- diff
+def _call_key(r):
+    """(tool, hash-of-arguments) for a tool_call row, so the same call
+    made with different arguments is visible as a modification."""
+    names = sorted(r.get("tool_names") or [])
+    tool = names[0] if names else "?"
+    c = str(r.get("content") or "")
+    # strip the volatile ids so two calls to the same tool with the same
+    # arguments hash the same
+    c = re.sub(r'"(?:call_)?id"\s*:\s*"[^"]*"', '"id":"_"', c)
+    c = re.sub(r'"response_item_id"\s*:\s*"[^"]*"', '"rid":"_"', c)
+    c = re.sub(r'"[0-9a-f]{8}-[0-9a-f-]{27,}"', '"uuid":"_"', c)
+    import hashlib
+    return tool, hashlib.sha1(c.encode("utf-8", "replace")).hexdigest()[:12]
+
+
+def _diff(tool, sid_a, sid_b, a, filt):
+    """Compare two sessions: structure, modified tool calls, prompt drift."""
+    ra, _ = _load_rows(tool, sid_a, filt)
+    rb, _ = _load_rows(tool, sid_b, filt)
+    if not ra or not rb:
+        print("one of the sessions has no rows", file=sys.stderr)
+        return
+
+    ca, cb = counts(ra), counts(rb)
+    fa, fb = fidelity_report(ra, sid_a, tool), fidelity_report(rb, sid_b, tool)
+
+    out = []
+    A = out.append
+    A(f"# DIFF - {tool}")
+    A("")
+    A(f"  A = {sid_a}   ({len(ra)} rows)")
+    A(f"  B = {sid_b}   ({len(rb)} rows)")
+    A("")
+
+    A("## STRUCTURE")
+    A("")
+    A("  kind                A      B     delta")
+    for key, label in (("u", "user messages"), ("a_ok", "assistant ok"),
+                       ("a_tool", "assistant tool calls"), ("tool", "tool outputs"),
+                       ("d", "developer"), ("reasoning", "reasoning"),
+                       ("empty", "empty"), ("lifecycle", "lifecycle"),
+                       ("error", "errors"), ("a_lost", "lost")):
+        va, vb = ca.get(key, 0), cb.get(key, 0)
+        if va or vb:
+            A(f"  {label:20} {va:5} {vb:6} {vb - va:+7}")
+    A(f"  {'content chars':20} {fa.get('content_chars', 0):5} "
+      f"{fb.get('content_chars', 0):6} "
+      f"{fb.get('content_chars', 0) - fa.get('content_chars', 0):+7}")
+    A("")
+
+    A("## TOOL USAGE")
+    A("")
+    ta, tb = {}, {}
+    for r in ra:
+        for t in (r.get("tool_names") or []):
+            ta[t] = ta.get(t, 0) + 1
+    for r in rb:
+        for t in (r.get("tool_names") or []):
+            tb[t] = tb.get(t, 0) + 1
+    changed = [t for t in sorted(set(ta) | set(tb)) if ta.get(t, 0) != tb.get(t, 0)]
+    if changed:
+        for t in changed:
+            A(f"  {t:24} {ta.get(t, 0):5} -> {tb.get(t, 0):<5} "
+              f"{tb.get(t, 0) - ta.get(t, 0):+6}")
+    else:
+        A("  (identical tool usage)")
+    A("")
+
+    A("## MODIFIED TOOL CALLS")
+    A("")
+    # group by TOOL, then compare the argument hashes within the tool --
+    # "the same tool, different arguments" is the signal a diff is for.
+    ga, gb = {}, {}
+    for r in ra:
+        if r.get("kind") == "tool_call":
+            t, h = _call_key(r)
+            ga.setdefault(t, {}).setdefault(h, 0)
+            ga[t][h] += 1
+    for r in rb:
+        if r.get("kind") == "tool_call":
+            t, h = _call_key(r)
+            gb.setdefault(t, {}).setdefault(h, 0)
+            gb[t][h] += 1
+
+    both = sorted(set(ga) & set(gb))
+    modified = []
+    same = []
+    for t in both:
+        ha, hb = set(ga[t]), set(gb[t])
+        if ha == hb:
+            same.append(t)
+        else:
+            modified.append(t)
+
+    if modified:
+        A(f"  {len(modified)} tool(s) called in BOTH but with DIFFERENT arguments:")
+        for t in modified:
+            ha, hb = set(ga[t]), set(gb[t])
+            only_a = ha - hb
+            only_b = hb - ha
+            A(f"    {t:22} A:{sum(ga[t].values())} call(s)/{len(ha)} arg-shape(s)   "
+              f"B:{sum(gb[t].values())} call(s)/{len(hb)} arg-shape(s)")
+            if only_a:
+                A(f"        {len(only_a)} arg-shape(s) only in A")
+            if only_b:
+                A(f"        {len(only_b)} arg-shape(s) only in B")
+    else:
+        A("  (no tool was called in both with different arguments)")
+    if same:
+        A(f"  {len(same)} tool(s) called identically in both: "
+          + ", ".join(same[:8]) + ("..." if len(same) > 8 else ""))
+    onlya = sorted(set(ga) - set(gb))
+    onlyb = sorted(set(gb) - set(ga))
+    if onlya:
+        A(f"  only in A: {', '.join(onlya[:10])}" + ("..." if len(onlya) > 10 else ""))
+    if onlyb:
+        A(f"  only in B: {', '.join(onlyb[:10])}" + ("..." if len(onlyb) > 10 else ""))
+    A("")
+
+    A("## PROMPT DRIFT")
+    A("")
+    pa = [r for r in ra if r.get("role") == "user" and not _is_injected(r)]
+    pb = [r for r in rb if r.get("role") == "user" and not _is_injected(r)]
+    A(f"  user messages: A={len(pa)}  B={len(pb)}")
+    if pa and pb:
+        fa_ = str(pa[0].get("content") or "").strip()
+        fb_ = str(pb[0].get("content") or "").strip()
+        if fa_ == fb_:
+            A("  opening intent: IDENTICAL")
+        else:
+            A("  opening intent: CHANGED")
+            A(f"    A: {clip(fa_.splitlines()[0] if fa_ else '', 100)}")
+            A(f"    B: {clip(fb_.splitlines()[0] if fb_ else '', 100)}")
+        # the first point of divergence
+        div = None
+        for i in range(min(len(pa), len(pb))):
+            if str(pa[i].get("content") or "").strip() != str(pb[i].get("content") or "").strip():
+                div = i
+                break
+        if div is not None:
+            A(f"  first divergence at user message #{div + 1}:")
+            A(f"    A: {clip(str(pa[div].get('content') or '').strip().splitlines()[0] if str(pa[div].get('content') or '').strip() else '', 100)}")
+            A(f"    B: {clip(str(pb[div].get('content') or '').strip().splitlines()[0] if str(pb[div].get('content') or '').strip() else '', 100)}")
+        else:
+            A("  every shared user message is identical")
+    A("")
+
+    print("\n".join(out))
+
+
 def main():
     global _REDACT, _FENCE
     ap = argparse.ArgumentParser(description="Universal AI conversation inspector.")
@@ -2613,6 +2864,12 @@ def main():
     ap.add_argument("--out", metavar="FILE")
     ap.add_argument("--format", choices=["md","jsonl","json","txt"], default="jsonl")
     ap.add_argument("--peek")
+    ap.add_argument("--summary", metavar="ID",
+                    help="session shape, token footprint and tool usage, "
+                         "without reading the transcript")
+    ap.add_argument("--diff", nargs=2, metavar=("ID_A", "ID_B"),
+                    help="compare two sessions: structure, modified tool "
+                         "calls, prompt drift")
     ap.add_argument("--handoff", metavar="ID",
                     help="build a handoff pack: last intent, unfinished tool "
                          "calls, and a token-budgeted tail, ready to seed a "
@@ -2664,6 +2921,10 @@ def main():
         elif a.peek:
             if a.harness == "all": _notice("--peek requires a single harness"); return
             _peek(a.harness, a.peek)
+        elif a.summary:
+            _summary(a.harness, a.summary, a, filt)
+        elif a.diff:
+            _diff(a.harness, a.diff[0], a.diff[1], a, filt)
         elif a.handoff:
             _handoff(a.harness, a.handoff, a, filt)
         elif a.tail:

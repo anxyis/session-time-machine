@@ -683,6 +683,88 @@ def main():
     else:
         skip("handoff CLI", "no hermes sessions")
 
+    # ---- phase 3: --summary and --diff -------------------------------
+    import importlib.util as _ilu2
+    _sp2 = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sessions.py")
+    _spec2 = _ilu2.spec_from_file_location("stm_mod2", _sp2)
+    stm2 = _ilu2.module_from_spec(_spec2)
+    _spec2.loader.exec_module(stm2)
+
+    hs2, _ = first_sid("hermes")
+    if hs2:
+        s = run("hermes", "--summary", hs2)
+        check("summary: exits 0", s.returncode == 0, s.stderr[-160:])
+        so = s.stdout
+        check("summary: has a SHAPE section", "## SHAPE" in so)
+        check("summary: has a TOOL USAGE section", "## TOOL USAGE" in so)
+        check("summary: has a FIDELITY section", "## FIDELITY" in so)
+        check("summary: reports the row count", "rows:" in so)
+        check("summary: reports a token estimate", "tokens est." in so)
+        check("summary: shows the opening prompt", "first user" in so)
+        check("summary: shows the closing answer", "last assistant" in so)
+        # the summary must be smaller than the transcript, and must not
+        # CONTAIN it -- a size ratio is only meaningful for a big session,
+        # so check both the ratio (when there is a big session) and the
+        # containment (always)
+        t_out = run("hermes", "--transcript", hs2).stdout
+        check("summary: smaller than the transcript",
+              len(so) < len(t_out), f"{len(so)} vs {len(t_out)}")
+        if len(t_out) > 4000:
+            check("summary: far smaller than a big transcript",
+                  len(so) < len(t_out) / 4, f"{len(so)} vs {len(t_out)}")
+        # it must not dump the transcript's rows
+        t_lines = [ln for ln in t_out.splitlines() if "] [" in ln]
+        if t_lines:
+            leaked = sum(1 for ln in t_lines if ln.strip()[:40] in so)
+            check("summary: does not dump the transcript",
+                  leaked < max(2, len(t_lines) // 4),
+                  f"{leaked}/{len(t_lines)} transcript lines leaked in")
+    else:
+        skip("summary CLI", "no hermes sessions")
+
+    # --diff needs two sessions
+    sid_list = []
+    o = run("hermes", "--list", "20")
+    for ln in o.stdout.splitlines():
+        if " | " in ln and "@session:" in ln:
+            sid_list.append(ln.split(" | ")[0].strip())
+    if len(sid_list) >= 2:
+        A_, B_ = sid_list[0], sid_list[1]
+        d = run("hermes", "--diff", A_, B_)
+        check("diff: exits 0", d.returncode == 0, d.stderr[-160:])
+        do = d.stdout
+        check("diff: has a STRUCTURE section", "## STRUCTURE" in do)
+        check("diff: has a TOOL USAGE section", "## TOOL USAGE" in do)
+        check("diff: has a MODIFIED TOOL CALLS section",
+              "## MODIFIED TOOL CALLS" in do)
+        check("diff: has a PROMPT DRIFT section", "## PROMPT DRIFT" in do)
+        check("diff: names both sessions", A_ in do and B_ in do)
+        # a diff against itself must be symmetric: no tool called with
+        # different arguments, and the opening intent identical
+        dd = run("hermes", "--diff", A_, A_)
+        check("diff: a session against itself shows no modified calls",
+              "called in BOTH but with DIFFERENT arguments" not in dd.stdout,
+              "self-diff reported modifications")
+        check("diff: a session against itself has an identical intent",
+              "opening intent: IDENTICAL" in dd.stdout)
+    else:
+        skip("diff CLI", "need 2 hermes sessions")
+
+    # the arg-hash must ignore volatile ids
+    _r1 = {"kind": "tool_call", "seq": 1, "tool_names": ["bash"],
+           "tool_call_id": None,
+           "content": '[{"id":"call_aaa","name":"bash","input":"ls -la"}]'}
+    _r2 = {"kind": "tool_call", "seq": 2, "tool_names": ["bash"],
+           "tool_call_id": None,
+           "content": '[{"id":"call_bbb","name":"bash","input":"ls -la"}]'}
+    _r3 = {"kind": "tool_call", "seq": 3, "tool_names": ["bash"],
+           "tool_call_id": None,
+           "content": '[{"id":"call_ccc","name":"bash","input":"ls -l /tmp"}]'}
+    check("diff: the same call with a different id hashes the same",
+          stm2._call_key(_r1) == stm2._call_key(_r2))
+    check("diff: different arguments hash differently",
+          stm2._call_key(_r1) != stm2._call_key(_r3))
+
     # cross-harness
     check("all --list exits 0", run("all","--list").returncode == 0)
     check("all --search exits 0", run("all","--search","the").returncode == 0)

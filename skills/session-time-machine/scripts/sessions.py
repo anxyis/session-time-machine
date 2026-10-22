@@ -830,27 +830,39 @@ def cline_list(n):
               f"{clip(model or '?',16)} via {clip(prov or '?',10)} | sub={sub} | @session:cline/{sid}")
 
 def cline_search(term):
+    """Search the cline sessions.
+
+    It goes through the ADAPTER, not the raw file: the adapter maps
+    the message shapes into normalized rows, and searching the raw
+    file with a different field mapping made the two disagree (the
+    transcript showed text the search could not find).
+    """
     db = ro(CLINEDB)
-    pat = "%" + term.replace("%", r"\%").replace("_", r"\_") + "%"
-    rows = db.execute("select session_id, model, provider, started_at, messages_path from sessions "
-                      "order by started_at desc limit 200").fetchall()
-    hits = []
-    for sid, model, prov, s, mp in rows:
-        if not mp or not os.path.isfile(mp): continue
+    try:
+        sids = [r[0] for r in db.execute("select session_id from sessions").fetchall()]
+    except sqlite3.Error:
+        return
+    needle = term.lower()
+    hits = 0
+    for sid in sids:
         try:
-            d = json.load(open(mp, encoding="utf-8"))
+            rows, info = _cline_rows(sid)
         except Exception:
             continue
-        for m in d.get("messages", []):
-            text = _block_texts(m.get("content"))
-            if term.lower() in text.lower():
-                snippet = clip(text, 140)
-                hits.append((sid, model, prov, ist_any(m.get("ts")), snippet))
-                if len(hits) >= 12: break
-        if len(hits) >= 12: break
-    for sid, model, prov, ts, snip in hits:
-        print(f"{sid} | {clip(model,16)} | {clip(prov,10)} | {ts} {snip}")
-    if not hits: print("(no matches)", file=sys.stderr)
+        for r in rows:
+            body = str(r.get("content") or "")
+            if needle in body.lower():
+                print(f"{sid} | {clip(info.get('model') or '',16)} | "
+                      f"{clip(info.get('provider') or '',10)} | "
+                      f"{r.get('ts')} {clip(body,140)}")
+                hits += 1
+                break
+        if hits >= 12:
+            break
+    if not hits:
+        print("(no matches)", file=sys.stderr)
+
+
 
 def _verbatim(v):
     """Push a raw value straight into `content`: pass strings through verbatim,
@@ -909,6 +921,9 @@ def _cline_rows(sid):
         with open(mp, encoding="utf-8", errors="replace") as fh:
             raw = fh.read()
         d = json.loads(raw)
+        # the file can be {"messages": [...]} or a bare LIST of messages
+        if isinstance(d, list):
+            d = {"messages": d}
     except (ValueError, OSError) as e:
         # truncated or corrupt JSON: salvage the complete message objects
         d = {"messages": []}
@@ -930,14 +945,37 @@ def _cline_rows(sid):
             idx = end
     out = []; seq = 0
     for m in d.get("messages", []):
+        if not isinstance(m, dict):
+            unrec.append(f"non-object message skipped: {type(m).__name__}")
+            continue
         role = m.get("role", "?")
         ts = ist_any(m.get("ts"))
         epoch = to_epoch(m.get("ts"))
         mi = m.get("modelInfo") or {}
-        text = _block_texts(m.get("content"))
-        content = text.strip() if text else ""
         blocks = m.get("content") or []
-        if not isinstance(blocks, list): blocks = []
+        if not isinstance(blocks, list):
+            blocks = []
+        # A message shape this adapter does not understand must NOT be
+        # dropped silently -- that is the exact failure the tool exists
+        # to prevent. Two shapes are understood:
+        #   {"role": "user", "content": [...]}              the real one
+        #   {"type": "say", "say": "user", "text": "..."}   the simple one
+        if role == "?" and blocks == []:
+            _say = m.get("say")
+            _text = m.get("text")
+            if isinstance(_text, str) and _text.strip():
+                role = _say or "user"
+                blocks = [{"type": "text", "text": _text}]
+            elif m.get("type") == "ask" or m.get("tool"):
+                role = "assistant"
+                blocks = [{"type": "tool_use", "id": m.get("id"),
+                           "name": m.get("tool") or "?", "input": m.get("input")}]
+            else:
+                unrec.append(f"unrecognised message shape skipped: "
+                             f"keys={sorted(m.keys())[:6]}")
+                continue
+        text = _block_texts(blocks)
+        content = text.strip() if text else ""
         # Split typed blocks so thinking, prose, tool arguments and tool results
         # each land in the right row kind. (Was: a `think` char-count was computed
         # and never emitted, and tool_call content was dropped.)

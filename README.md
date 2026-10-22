@@ -322,15 +322,13 @@ developed and verified on Linux.
 
 ## ◈ what's in the works next? (o゜▽゜)o☆
 
-- **A local index** — right now `--search` is a linear scan of every session file.
-  An incremental FTS5 cache would make it instant and give stable cross-harness
-  session ids.
 - **Streaming/live tail** — follow a session as it's happening instead of after the fact.
 - **More harnesses** — Windsurf, Aider, Goose, and whatever else shows up with a weird
   enough storage format to be interesting.
 
 Already built, if you missed them: `--summary` (the shape of a session without reading it),
-`--diff` (two sessions compared), and `--handoff` (the pack you paste into a fresh session).
+`--diff` (two sessions compared), `--handoff` (the pack you paste into a fresh session),
+and the local **FTS5 index** (`--reindex`) that makes `--search` ~20x faster.
 
 <br/>
 

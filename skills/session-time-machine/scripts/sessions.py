@@ -36,6 +36,7 @@ Filters (composable, AND-ed; apply to any row-producing command):
   --clip N            truncate display body to N chars with an explicit marker
 """
 import argparse, collections, json, sqlite3, sys, os, glob, datetime, signal, re
+__version__ = "0.2.0"
 # SIGPIPE does not exist on Windows, and setting it unguarded made the
 # import fail there -- while the README says Windows works.
 if hasattr(signal, "SIGPIPE"):
@@ -3679,6 +3680,11 @@ _HUMAN_VERBS = {
     "status": "--index-status",
     "reindex": "--reindex",
     "completion": "--completion",
+    "path": "--path",
+    "which": "--path",
+    "file": "--path",
+    "harnesses": "--harnesses",
+    "info": "--harnesses",
 }
 
 
@@ -3731,7 +3737,7 @@ _stm() {
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
   fi
-  local verbs="ls list recent peek summary diff handoff search find grep cat transcript tail preview json jsonl md export status reindex completion"
+  local verbs="ls list recent peek summary diff handoff search find grep cat transcript tail preview json jsonl md export status reindex completion path which harnesses info version"
   local harnesses="hermes opencode cline codex agy omp pi all"
   local flags="--role --kind --model --provider --contains --tool --errors --no-tools --context --redact --no-redact --budget --fence --no-fence --clip --since --until --date"
 
@@ -3789,6 +3795,11 @@ _stm() {
     'status:Check local search index status'
     'reindex:Update local search index'
     'completion:Generate shell completions'
+    'path:Print raw storage file/db path on disk'
+    'which:Print raw storage file/db path on disk'
+    'harnesses:List detected harnesses, session counts and storage'
+    'info:List detected harnesses, session counts and storage'
+    'version:Print version information'
   )
   harnesses=(
     'all:Search/list across all harnesses'
@@ -3836,6 +3847,9 @@ complete -c stm -n "__fish_use_subcommand" -a "md" -d "Export session as Markdow
 complete -c stm -n "__fish_use_subcommand" -a "status" -d "Check local search index status"
 complete -c stm -n "__fish_use_subcommand" -a "reindex" -d "Rebuild local search index"
 complete -c stm -n "__fish_use_subcommand" -a "completion" -d "Generate shell completions"
+complete -c stm -n "__fish_use_subcommand" -a "path" -d "Print raw storage file/db path on disk"
+complete -c stm -n "__fish_use_subcommand" -a "harnesses" -d "List detected harnesses and storage"
+complete -c stm -n "__fish_use_subcommand" -a "version" -d "Print version information"
 
 for h in hermes opencode cline codex agy omp pi all
     complete -c stm -n "__fish_use_subcommand" -a $h -d "Target harness: $h"
@@ -3861,8 +3875,10 @@ def _rewrite_human_argv(argv):
     if not argv:
         return ["all", "--list", "10"]
     a = list(argv)
-    if a[0] in ("-h", "--help"):
-        return ["all", a[0]]
+    if a[0] in ("-v", "--version", "version"):
+        return ["all", "--version"]
+    if a[0] in ("-h", "--help", "help"):
+        return ["all", "--help"]
     if a[0] in (HARNESSES + ["all"]):
         h = a.pop(0)
         if a and a[0] in _HUMAN_VERBS:
@@ -3875,12 +3891,162 @@ def _rewrite_human_argv(argv):
     return ["all", *a]
 
 
+def _get_latest_session(harness):
+    """Return (epoch, sid, harness) for the latest session in a given harness."""
+    try:
+        if harness == "hermes":
+            db = ro(HB)
+            row = db.execute("select id, started_at from sessions order by started_at desc limit 1").fetchone()
+            if row:
+                epoch = to_epoch(row[1]) or 0
+                return (epoch, row[0], "hermes")
+        elif harness == "opencode":
+            db = ro(ODB)
+            cols = [c[1] for c in db.execute("pragma table_info(session)")]
+            order_col = "time_updated" if "time_updated" in cols else ("time_created" if "time_created" in cols else "id")
+            row = db.execute(f"select id, {order_col} from session order by {order_col} desc limit 1").fetchone()
+            if row:
+                epoch = to_epoch(row[1]) or 0
+                return (epoch, row[0], "opencode")
+        elif harness == "cline":
+            db = ro(CLINEDB)
+            cols = [c[1] for c in db.execute("pragma table_info(sessions)")]
+            order_col = "last_modified" if "last_modified" in cols else "session_id"
+            row = db.execute(f"select session_id, {order_col} from sessions order by {order_col} desc limit 1").fetchone()
+            if row:
+                epoch = to_epoch(row[1]) or 0
+                return (epoch, row[0], "cline")
+        elif harness == "codex":
+            cands = []
+            for f in _codex_all_files():
+                if os.path.isfile(f):
+                    cands.append((os.path.getmtime(f), f))
+            if cands:
+                cands.sort(reverse=True)
+                sid = None
+                with open(cands[0][1], encoding="utf-8") as fh:
+                    for ln in fh:
+                        if "session_meta" in ln:
+                            try:
+                                sid = json.loads(ln).get("payload", {}).get("session_id")
+                                if sid:
+                                    break
+                            except Exception:
+                                pass
+                return (cands[0][0], sid or os.path.basename(cands[0][1]), "codex")
+        elif harness == "agy":
+            dirs = [d for d in glob.glob(os.path.join(AGY_BRAIN, "*")) if os.path.isdir(d)]
+            if dirs:
+                dirs.sort(key=os.path.getmtime, reverse=True)
+                return (os.path.getmtime(dirs[0]), os.path.basename(dirs[0]), "agy")
+        elif harness in ("omp", "pi"):
+            sess = omp_list_sessions(harness, limit=1)
+            if sess:
+                mt, sid = sess[0][0], sess[0][1]
+                return (mt, sid, harness)
+    except Exception:
+        pass
+    return None
+
+
+def _resolve_last(tool="all"):
+    """Find the newest session across all harnesses (or within a specified harness)."""
+    pool = [tool] if (tool and tool != "all") else HARNESSES
+    latest = []
+    for h in pool:
+        res = _get_latest_session(h)
+        if res and res[1]:
+            latest.append(res)
+    if not latest:
+        return None, None
+    latest.sort(key=lambda x: x[0], reverse=True)
+    return latest[0][2], latest[0][1]
+
+
+def _session_path(tool, sid):
+    """Print the exact filesystem path to the raw storage file/db for a session."""
+    h, resolved_sid = _resolve_session(tool, sid)
+    path = ""
+    if h == "hermes":
+        path = os.path.expanduser(HB)
+    elif h == "opencode":
+        path = os.path.expanduser(ODB)
+    elif h == "cline":
+        try:
+            db = ro(CLINEDB)
+            r = db.execute("select messages_path from sessions where session_id=?", (resolved_sid,)).fetchone()
+            if r and r[0]:
+                mp = r[0]
+                if not os.path.isabs(mp):
+                    mp = os.path.join(os.path.dirname(os.path.abspath(CLINEDB)), mp)
+                path = mp
+            else:
+                path = os.path.expanduser(CLINEDB)
+        except Exception:
+            path = os.path.expanduser(CLINEDB)
+    elif h == "codex":
+        f = _codex_file(resolved_sid)
+        path = f or os.path.expanduser(CODEX_SESSION_DIR)
+    elif h == "agy":
+        tp = os.path.join(AGY_BRAIN, resolved_sid, ".system_generated", "logs", "transcript_full.jsonl")
+        if os.path.isfile(tp):
+            path = tp
+        else:
+            p = os.path.join(AGY_DIR, resolved_sid + ".db")
+            path = p if os.path.isfile(p) else tp
+    elif h in ("omp", "pi"):
+        _, p = omp_find_session(resolved_sid)
+        path = p or "not found"
+    print(path)
+
+
+def _show_harnesses():
+    """Display detected harnesses, session counts, and raw storage paths."""
+    print(f"{'HARNESS':<12} {'DETECTED':<10} {'SESSIONS':<10} {'STORAGE'}")
+    for h in HARNESSES:
+        ids = _all_session_ids(h)
+        count = len(ids)
+        path = ""
+        detected = False
+        if h == "hermes":
+            path = HB
+            detected = os.path.exists(os.path.expanduser(path))
+        elif h == "opencode":
+            path = ODB
+            detected = os.path.exists(os.path.expanduser(path))
+        elif h == "cline":
+            path = CLINEDB
+            detected = os.path.exists(os.path.expanduser(path))
+        elif h == "codex":
+            path = CODEX_SESSION_DIR
+            detected = os.path.isdir(os.path.expanduser(path))
+        elif h == "agy":
+            path = AGY_BRAIN
+            detected = os.path.isdir(os.path.expanduser(path))
+        elif h in ("omp", "pi"):
+            root = os.path.expanduser(f"~/.{h}/agent/sessions")
+            path = root
+            detected = os.path.isdir(root)
+            if not detected and os.path.isdir(os.path.expanduser("~/.agents/sessions")):
+                path = "~/.agents/sessions"
+                detected = True
+        status = "yes" if detected else "no"
+        display_path = path.replace(os.path.expanduser("~"), "~")
+        print(f"{h:<12} {status:<10} {count:<10} {display_path}")
+
+
 def _resolve_session(tool, sid):
     """Auto-detect harness for sid if tool is 'all' or sid is not found in specified tool."""
     if not sid or not str(sid).strip():
         print("error: empty session id", file=sys.stderr)
         sys.exit(2)
     sid = str(sid).strip()
+    if sid.lower() in ("last", "@last", "latest", "-1"):
+        h_last, s_last = _resolve_last(tool)
+        if s_last:
+            return h_last, s_last
+        print("error: no sessions found", file=sys.stderr)
+        sys.exit(2)
     if sid.startswith("@session:"):
         sid = sid[len("@session:"):]
     sid = sid.strip()
@@ -3926,8 +4092,35 @@ def _resolve_session(tool, sid):
 
 def main():
     global _REDACT, _FENCE, _INDEX_LIMIT
-    ap = argparse.ArgumentParser(description="Universal AI conversation inspector.")
+    ap = argparse.ArgumentParser(
+        prog="stm",
+        description="Universal AI conversation inspector across coding agents.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+commands (human verbs):
+  stm ls [N]                   list recent sessions across all harnesses (or one)
+  stm peek <id|last>           inspect session health, model, tokens, fidelity gaps
+  stm cat <id|last>            read full session transcript (auto-paged in TTY)
+  stm tail <id|last> [N]       last N rows of transcript
+  stm preview <id|last> [N]    first N rows of transcript
+  stm search <query>           instant FTS5 index search across sessions
+  stm summary <id|last>        session shape, token footprint & tool usage (~1.5 KB)
+  stm diff <id1> <id2>         structural comparison, tool changes, prompt drift
+  stm handoff <id|last>        pack intent, unfinished calls & tail to resume session
+  stm path <id|last>           print raw storage file/db path on disk
+  stm harnesses                list detected harnesses, session counts & storage
+  stm status                   local search index status
+  stm reindex                  update local search index
+  stm completion <shell>       print shell completion script (bash, zsh, fish)
+
+harnesses:
+  hermes, opencode, cline, codex, agy, omp, pi, all (default)
+"""
+    )
+    ap.add_argument("--version", "-v", action="version", version=f"session-time-machine {__version__}")
     ap.add_argument("harness", choices=HARNESSES + ["all"])
+    ap.add_argument("--path", metavar="ID", help="print raw storage file path for session")
+    ap.add_argument("--harnesses", action="store_true", help="list detected harnesses, session counts and storage")
     ap.add_argument("--list", type=int, nargs="?", const=20)
     ap.add_argument("--recent", type=int, nargs="?", const=8)
     ap.add_argument("--source", choices=["telegram","cli","subagent","cron","all"])
@@ -4021,6 +4214,10 @@ def main():
     try:
         if a.completion:
             _print_completion(a.completion)
+        elif a.harnesses:
+            _show_harnesses()
+        elif a.path:
+            _session_path(a.harness, a.path)
         elif a.logs is not None:
             agy_logs(a.logs)
         elif a.list is not None or a.recent is not None:

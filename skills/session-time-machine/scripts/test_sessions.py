@@ -1224,6 +1224,12 @@ def main():
     check("cli: completion zsh exits 0 and defines compdef", "compdef _stm stm" in run("completion", "zsh").stdout)
     check("cli: completion fish exits 0 and defines complete -c stm", "complete -c stm" in run("completion", "fish").stdout)
     check("cli: pager starts safely without tty", sessions._start_pager() is None)
+    check("cli: --version exits 0", "session-time-machine" in run("--version").stdout)
+    check("cli: version verb exits 0", "session-time-machine" in run("version").stdout)
+    check("cli: harnesses verb exits 0 and shows table", "HARNESS" in run("harnesses").stdout)
+    check("cli: path verb prints file/db location", bool(run("path", "last").stdout.strip()))
+    check("cli: last keyword resolves to newest session", run("peek", "last").returncode == 0)
+    check("cli: help includes human verbs", "commands (human verbs)" in run("--help").stdout)
     print(f"\n=== {P} passed, {F} failed ===")
     sys.exit(0 if F == 0 else 1)
 

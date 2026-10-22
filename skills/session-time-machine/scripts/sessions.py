@@ -3678,7 +3678,182 @@ _HUMAN_VERBS = {
     "export": "--export",
     "status": "--index-status",
     "reindex": "--reindex",
+    "completion": "--completion",
 }
+
+
+def _start_pager():
+    """Wrap sys.stdout in a pager (less -FRX) if stdout is a TTY and not disabled."""
+    if not sys.stdout.isatty():
+        return None
+    if os.environ.get("PAGER") == "":
+        return None
+    if os.environ.get("TERM") in ("dumb", ""):
+        return None
+    if os.environ.get("CI"):
+        return None
+    import shlex
+    cmd = shlex.split(os.environ.get("PAGER", "less"))
+    env = dict(os.environ)
+    if "less" in cmd[0]:
+        env["LESS"] = env.get("LESS", "FRX")
+    try:
+        p = subprocess.Popen(cmd, stdin=subprocess.PIPE, text=True)
+        orig_stdout = sys.stdout
+        sys.stdout = p.stdin
+        return p, orig_stdout
+    except OSError:
+        return None
+
+
+def _stop_pager(pager_info):
+    """Cleanly close pager stdin and wait for pager process."""
+    if not pager_info:
+        return
+    p, orig_stdout = pager_info
+    sys.stdout = orig_stdout
+    try:
+        p.stdin.close()
+    except (BrokenPipeError, OSError):
+        pass
+    try:
+        p.wait()
+    except (KeyboardInterrupt, BrokenPipeError, OSError):
+        pass
+
+
+_COMPLETION_BASH = """# bash completion for stm
+_stm() {
+  local cur prev words cword
+  if type _init_completion >/dev/null 2>&1; then
+    _init_completion || return
+  else
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    prev="${COMP_WORDS[COMP_CWORD-1]}"
+  fi
+  local verbs="ls list recent peek summary diff handoff search find grep cat transcript tail preview json jsonl md export status reindex completion"
+  local harnesses="hermes opencode cline codex agy omp pi all"
+  local flags="--role --kind --model --provider --contains --tool --errors --no-tools --context --redact --no-redact --budget --fence --no-fence --clip --since --until --date"
+
+  if [ "${COMP_CWORD}" -eq 1 ]; then
+    COMPREPLY=($(compgen -W "$verbs $harnesses" -- "$cur"))
+    return 0
+  fi
+
+  case "$prev" in
+    completion)
+      COMPREPLY=($(compgen -W "bash zsh fish" -- "$cur"))
+      return 0
+      ;;
+    --role)
+      COMPREPLY=($(compgen -W "user assistant tool system developer meta" -- "$cur"))
+      return 0
+      ;;
+    --context)
+      COMPREPLY=($(compgen -W "live compacted" -- "$cur"))
+      return 0
+      ;;
+    *)
+      if [[ "$cur" == -* ]]; then
+        COMPREPLY=($(compgen -W "$flags" -- "$cur"))
+      fi
+      ;;
+  esac
+}
+complete -F _stm stm
+"""
+
+_COMPLETION_ZSH = """#compdef stm
+
+_stm() {
+  local -a verbs harnesses
+  verbs=(
+    'ls:List recent sessions'
+    'list:List recent sessions'
+    'recent:List recent sessions'
+    'peek:Inspect session metadata, tokens, and health'
+    'summary:Show structural shape, tokens, and tool usage'
+    'diff:Compare two sessions'
+    'handoff:Build handoff pack to resume session'
+    'search:Search across session history'
+    'find:Search across session history'
+    'grep:Search across session history'
+    'cat:Print full transcript'
+    'transcript:Print full transcript'
+    'tail:Show recent transcript tail'
+    'preview:Preview start of transcript'
+    'json:Export session as JSON'
+    'jsonl:Export session as JSONL'
+    'md:Export session as Markdown'
+    'export:Export session to a file'
+    'status:Check local search index status'
+    'reindex:Update local search index'
+    'completion:Generate shell completions'
+  )
+  harnesses=(
+    'all:Search/list across all harnesses'
+    'hermes:Hermes Agent'
+    'opencode:OpenCode CLI'
+    'cline:Cline'
+    'codex:Codex CLI'
+    'agy:Antigravity CLI'
+    'omp:Oh-My-Pi'
+    'pi:Pi'
+  )
+
+  if (( CURRENT == 2 )); then
+    _describe -t verbs 'verbs' verbs
+    _describe -t harnesses 'harnesses' harnesses
+    return 0
+  fi
+
+  case "$words[2]" in
+    completion)
+      _values 'shell' bash zsh fish
+      return 0
+      ;;
+  esac
+}
+
+compdef _stm stm
+"""
+
+_COMPLETION_FISH = """# fish completion for stm
+complete -c stm -f
+
+complete -c stm -n "__fish_use_subcommand" -a "ls" -d "List recent sessions"
+complete -c stm -n "__fish_use_subcommand" -a "peek" -d "Inspect session health and stats"
+complete -c stm -n "__fish_use_subcommand" -a "summary" -d "Show structural shape and tool usage"
+complete -c stm -n "__fish_use_subcommand" -a "diff" -d "Compare two sessions"
+complete -c stm -n "__fish_use_subcommand" -a "handoff" -d "Build handoff pack to resume session"
+complete -c stm -n "__fish_use_subcommand" -a "search" -d "Search across session history"
+complete -c stm -n "__fish_use_subcommand" -a "cat" -d "Print full transcript"
+complete -c stm -n "__fish_use_subcommand" -a "tail" -d "Show recent transcript tail"
+complete -c stm -n "__fish_use_subcommand" -a "preview" -d "Preview start of transcript"
+complete -c stm -n "__fish_use_subcommand" -a "json" -d "Export session as JSON"
+complete -c stm -n "__fish_use_subcommand" -a "jsonl" -d "Export session as JSONL"
+complete -c stm -n "__fish_use_subcommand" -a "md" -d "Export session as Markdown"
+complete -c stm -n "__fish_use_subcommand" -a "status" -d "Check local search index status"
+complete -c stm -n "__fish_use_subcommand" -a "reindex" -d "Rebuild local search index"
+complete -c stm -n "__fish_use_subcommand" -a "completion" -d "Generate shell completions"
+
+for h in hermes opencode cline codex agy omp pi all
+    complete -c stm -n "__fish_use_subcommand" -a $h -d "Target harness: $h"
+end
+
+complete -c stm -n "__fish_seen_subcommand_from completion" -a "bash zsh fish"
+"""
+
+def _print_completion(shell):
+    if shell == "bash":
+        print(_COMPLETION_BASH.strip())
+    elif shell == "zsh":
+        print(_COMPLETION_ZSH.strip())
+    elif shell == "fish":
+        print(_COMPLETION_FISH.strip())
+    else:
+        print(f"unknown shell: {shell}", file=sys.stderr)
+        sys.exit(2)
 
 
 def _rewrite_human_argv(argv):
@@ -3821,6 +3996,8 @@ def main():
     ap.add_argument("--no-fence", dest="fence", action="store_false",
                     help="do NOT fence replayed content")
     ap.add_argument("--clip", type=int, metavar="N", help="truncate display body to N chars (explicit marker)")
+    ap.add_argument("--completion", choices=["bash", "zsh", "fish"],
+                    help="print shell completion script for eval")
     raw_args = sys.argv[1:]
     rewritten_args = _rewrite_human_argv(raw_args)
     a = ap.parse_args(rewritten_args)
@@ -3834,8 +4011,17 @@ def main():
     if a.fence is not None: _FENCE = a.fence
     filt = Filt(a)
     if filt.active(): _notice(describe_filters(filt))
+
+    pager_actions = (
+        a.list is not None or a.recent is not None or
+        a.search or a.diff or a.summary or a.handoff or
+        a.tail or a.transcript or a.preview
+    )
+    pager_info = _start_pager() if pager_actions else None
     try:
-        if a.logs is not None:
+        if a.completion:
+            _print_completion(a.completion)
+        elif a.logs is not None:
             agy_logs(a.logs)
         elif a.list is not None or a.recent is not None:
             _do_list(a.harness, a.list if a.list is not None else a.recent, a)
@@ -3883,11 +4069,14 @@ def main():
             _render(h, sid, "export", a, filt)
         else:
             _do_list(a.harness, 8, a)
+    except BrokenPipeError:
+        pass
     except FileNotFoundError as e:
         print(f"db/directory not found: {e.filename or e}", file=sys.stderr); sys.exit(1)
     except sqlite3.Error as e:
         print("db error:", e, file=sys.stderr); _report_redaction(); sys.exit(1)
     finally:
+        _stop_pager(pager_info)
         _report_redaction()
 
 if __name__ == "__main__":

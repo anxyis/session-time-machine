@@ -83,16 +83,21 @@ stm handoff <id>
 
 ## ◈ what you get
 
-| Command | What it does |
-|---|---|
-| `--list [N]` | recent sessions for a harness |
-| `--peek ID` | size, model, and **fidelity** *before* you load anything |
-| `--transcript ID` | readable transcript — full text by default, no truncation |
-| `--tail ID N` | last N rows. the "what just happened" view |
-| `--preview ID` | short peek at the head of a session |
-| `--search TERM` | full-text search across sessions |
-| `--jsonl` / `--json` / `--md` | machine-readable or markdown |
-| `--export ID --out F` | write it to a file (`md`/`jsonl`/`json`/`txt`) |
+| Human verb | Canonical flag | What it does |
+|---|---|---|
+| `stm ls [N]` | `--list [N]` | recent sessions across all harnesses (or one) |
+| `stm peek ID` | `--peek ID` | size, model, and **fidelity** *before* you load anything |
+| `stm cat ID` | `--transcript ID` | readable transcript — auto-paged in TTY via `less -FRX` |
+| `stm tail ID [N]` | `--tail ID [N]` | last N rows. the "what just happened" view |
+| `stm preview ID` | `--preview ID` | short peek at the head of a session |
+| `stm search TERM` | `--search TERM` | instant FTS5 index search across all harnesses |
+| `stm summary ID` | `--summary ID` | session shape, token footprint & tool usage (~1.5 KB) |
+| `stm diff ID_A ID_B`| `--diff ID_A ID_B` | structural comparison, tool changes, prompt drift |
+| `stm handoff ID` | `--handoff ID` | pack intent, unfinished calls & budgeted tail to resume |
+| `stm status` | `--index-status` | local search index status |
+| `stm completion B` | `--completion B` | shell completions for `bash`, `zsh`, or `fish` |
+| — | `--jsonl` / `--json` / `--md` | lossless machine-readable or markdown stream |
+| — | `--export ID --out F` | write session to a file (`0600` permissions) |
 
 Filters stack with AND semantics — pick the ones you want:
 

@@ -1220,6 +1220,10 @@ def main():
     check("all --list exits 0", run("all","--list").returncode == 0)
     check("all --search exits 0", run("all","--search","the").returncode == 0)
     check("cli stm ls exits 0", run("ls", "2").returncode == 0)
+    check("cli: completion bash exits 0 and defines _stm", "_stm()" in run("completion", "bash").stdout)
+    check("cli: completion zsh exits 0 and defines compdef", "compdef _stm stm" in run("completion", "zsh").stdout)
+    check("cli: completion fish exits 0 and defines complete -c stm", "complete -c stm" in run("completion", "fish").stdout)
+    check("cli: pager starts safely without tty", sessions._start_pager() is None)
     print(f"\n=== {P} passed, {F} failed ===")
     sys.exit(0 if F == 0 else 1)
 

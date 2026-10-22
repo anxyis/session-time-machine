@@ -2098,17 +2098,16 @@ def _omp_rows_for(path, sid, harness):
 def omp_find_session(sid):
     """Locate a session file by id across both roots. Returns
     (harness, path) or (None, None)."""
+    if not sid or not str(sid).strip():
+        return None, None
+    sid = str(sid).strip()
     for harness, root in _OMP_ROOTS:
         for _, path in _omp_iter_session_files(root):
-            if _omp_session_id(path) == sid:
+            if _omp_session_id(path) == sid or os.path.basename(path) == sid:
                 return harness, path
-    # allow a full path or a unique suffix
+    # allow a full path
     if os.path.isfile(sid):
         return ("omp" if "/.omp/" in sid else "pi"), sid
-    for harness, root in _OMP_ROOTS:
-        for _, path in _omp_iter_session_files(root):
-            if os.path.basename(path).startswith(sid):
-                return harness, path
     return None, None
 
 
@@ -3698,45 +3697,56 @@ def _rewrite_human_argv(argv):
     if a[0] in _HUMAN_VERBS:
         verb = _HUMAN_VERBS[a.pop(0)]
         return ["all", verb, *a]
-    if a[0].startswith("-"):
-        return ["all", *a]
     return ["all", *a]
 
 
 def _resolve_session(tool, sid):
     """Auto-detect harness for sid if tool is 'all' or sid is not found in specified tool."""
-    if not sid:
-        return tool, sid
+    if not sid or not str(sid).strip():
+        print("error: empty session id", file=sys.stderr)
+        sys.exit(2)
     sid = str(sid).strip()
     if sid.startswith("@session:"):
         sid = sid[len("@session:"):]
+    sid = sid.strip()
+    if not sid:
+        print("error: empty session id", file=sys.stderr)
+        sys.exit(2)
     if "/" in sid:
         parts = sid.split("/", 1)
         h = parts[0]
         if h == "default":
             h = "hermes"
-        if h in HARNESSES:
+        if h in HARNESSES and parts[1]:
             return h, parts[1]
 
-    if tool and tool != "all":
-        rows, _ = _get_rows(tool, sid)
-        if rows:
-            return tool, sid
+    pool = [tool] if (tool and tool != "all") else HARNESSES
 
-    # Probe all harnesses exact
-    for h in HARNESSES:
+    # 1. Exact match across pool
+    for h in pool:
         rows, _ = _get_rows(h, sid)
         if rows:
             return h, sid
 
-    # Prefix match across all harnesses
-    for h in HARNESSES:
-        ids = _all_session_ids(h)
-        for s in ids:
+    # 2. Prefix match across pool
+    hits = []
+    for h in pool:
+        for s in _all_session_ids(h):
             if s.startswith(sid):
-                return h, s
+                hits.append((h, s))
 
-    return ("hermes" if tool == "all" else tool), sid
+    if len(hits) == 1:
+        return hits[0]
+    elif len(hits) > 1:
+        unique_sids = {s for _, s in hits}
+        if len(unique_sids) == 1:
+            return hits[0]
+        lines = [f"  {h}/{s}" for h, s in hits[:5]]
+        more = f"\n  ... ({len(hits) - 5} more)" if len(hits) > 5 else ""
+        print(f"error: '{sid}' is ambiguous ({len(hits)} matches):\n" + "\n".join(lines) + more, file=sys.stderr)
+        sys.exit(2)
+
+    return (tool if tool != "all" else "hermes"), sid
 
 
 def main():

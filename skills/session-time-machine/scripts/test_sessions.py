@@ -1149,17 +1149,72 @@ def main():
           sessions._rewrite_human_argv(["peek", "s1"]) == ["all", "--peek", "s1"])
     check("cli: search verb rewrites to --search",
           sessions._rewrite_human_argv(["search", "foo"]) == ["all", "--search", "foo"])
+    check("cli: search verb as query preserved",
+          sessions._rewrite_human_argv(["search", "ls"]) == ["all", "--search", "ls"])
     check("cli: diff verb rewrites to --diff",
           sessions._rewrite_human_argv(["diff", "s1", "s2"]) == ["all", "--diff", "s1", "s2"])
     check("cli: harness prefix preserved with verb",
           sessions._rewrite_human_argv(["hermes", "peek", "s1"]) == ["hermes", "--peek", "s1"])
     check("cli: legacy flags preserved",
           sessions._rewrite_human_argv(["hermes", "--peek", "s1"]) == ["hermes", "--peek", "s1"])
+    _arg_orig = ["ls", "3"]
+    sessions._rewrite_human_argv(_arg_orig)
+    check("cli: rewrite does not mutate input", _arg_orig == ["ls", "3"])
 
+    # test session resolution
     _ha, _ = sessions._resolve_session("all", "@session:default/s1")
     check("cli: resolve @session:default/ prefix to hermes", _ha == "hermes")
     _hb, _ = sessions._resolve_session("all", "@session:codex/01a15ea2")
     check("cli: resolve @session:codex/ prefix to codex", _hb == "codex")
+
+    # edge cases from adversarial review
+    for _blank in ("  ", "@session:", "@session:  ", ""):
+        try:
+            sessions._resolve_session("all", _blank)
+            _blank_err = False
+        except SystemExit:
+            _blank_err = True
+        check(f"cli: blank session id {_blank!r} rejected", _blank_err)
+
+    # exact beats prefix
+    _orig_ids = sessions._all_session_ids
+    _orig_rows = sessions._get_rows
+    try:
+        _mock_data = {
+            "hermes": ["20261021_exact", "20261021_exact_longer", "20261021_other"],
+            "codex": ["01a_unique", "01a_other"],
+            "cline": []
+        }
+        sessions._all_session_ids = lambda h: _mock_data.get(h, [])
+        sessions._get_rows = lambda h, s: ([{"r": 1}], None) if s in _mock_data.get(h, []) else ([], None)
+
+        _hx, _sx = sessions._resolve_session("all", "20261021_exact")
+        check("cli: exact match beats prefix match", _hx == "hermes" and _sx == "20261021_exact")
+
+        _hy, _sy = sessions._resolve_session("all", "01a_un")
+        check("cli: unique prefix resolves", _hy == "codex" and _sy == "01a_unique")
+
+        # ambiguous prefix
+        try:
+            sessions._resolve_session("all", "20261021_")
+            _ambig = False
+        except SystemExit:
+            _ambig = True
+        check("cli: ambiguous prefix raises SystemExit", _ambig)
+
+        # explicit tool scoping does not leak to another harness
+        _h_scoped, _ = sessions._resolve_session("hermes", "01a_un")
+        check("cli: explicit harness scope does not leak", _h_scoped == "hermes")
+
+        # adversarial ids do not crash with unhandled exception
+        for _bad in ("../../etc/passwd", "hermes/../../x", "a\x00b", "x" * 5000, "s1; rm -rf ~"):
+            try:
+                sessions._resolve_session("all", _bad)
+            except (SystemExit, Exception) as _e:
+                check(f"cli: adversarial id {_bad[:15]!r} handled safely", not isinstance(_e, (NameError, AttributeError, TypeError)))
+    finally:
+        sessions._all_session_ids = _orig_ids
+        sessions._get_rows = _orig_rows
 
     # cross-harness
     check("all --list exits 0", run("all","--list").returncode == 0)

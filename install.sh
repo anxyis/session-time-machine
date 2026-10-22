@@ -46,27 +46,32 @@ usage() {
 session-time-machine installer
 
 Usage:
-  ./install.sh                 install for every detected agent (global)
+  ./install.sh                 install for every detected agent (global) + CLI tool
+  ./install.sh --cli           install only the human CLI tool (~/.local/bin/stm)
+  ./install.sh --no-cli        skip installing the human CLI tool
   ./install.sh --project       install into the current project instead of globally
   ./install.sh --agent NAME    install for one agent (repeatable)
   ./install.sh --all           install for every known agent, detected or not
   ./install.sh --list          list known agents and whether they are detected
   ./install.sh --dry-run       show what would happen, change nothing
-  ./install.sh --uninstall     remove the skill from the selected targets
+  ./install.sh --uninstall     remove the skill and CLI tool
   ./install.sh --help
 
 Examples:
+  ./install.sh
   ./install.sh --agent claude-code --agent codex
   ./install.sh --project --agent opencode
 EOF
 }
 
 TARGETS=""
-PROJECT=0; ALL=0; LIST=0; UNINSTALL=0; DRYRUN=0
+PROJECT=0; ALL=0; LIST=0; UNINSTALL=0; DRYRUN=0; CLI=1; CLI_EXPLICIT=0
 while [ $# -gt 0 ]; do
   case "$1" in
-    --project) PROJECT=1 ;;
+    --project) PROJECT=1; [ "$CLI_EXPLICIT" = 0 ] && CLI=0 ;;
     --global)  PROJECT=0 ;;
+    --cli)     CLI=1; CLI_EXPLICIT=1 ;;
+    --no-cli)  CLI=0; CLI_EXPLICIT=1 ;;
     --agent)
       if [ $# -lt 2 ]; then echo "error: --agent needs an agent name" >&2; exit 2; fi
       TARGETS="$TARGETS $2"; shift ;;
@@ -190,6 +195,9 @@ for t in $TARGETS; do
   proj="${entry#*|}"; proj="${proj%%|*}"; glob="${entry##*|}"
   if [ "$PROJECT" = 1 ]; then base="$proj"; else base="$glob"; fi
   dest="$base/$SKILL"
+  if [ "$PROJECT" = 0 ] && [ "$t" = "hermes-agent" ] && [ -d "$HOME/.hermes/skills/devops/$SKILL" ]; then
+    dest="$HOME/.hermes/skills/devops/$SKILL"
+  fi
 
   # Several agents can share one directory (pi/omp/zed all use .agents/skills).
   # Install once, then just note the alias.
@@ -260,6 +268,37 @@ for t in $TARGETS; do
   installed=$((installed+1))
 done
 
+# CLI tool installation (~/.local/bin/stm)
+if [ "$CLI" = 1 ]; then
+  BIN_DIR="${XDG_BIN_HOME:-$HOME/.local/bin}"
+  cli_target="$BIN_DIR/stm"
+  if [ "$DRYRUN" = 1 ]; then
+    if [ "$UNINSTALL" = 1 ]; then
+      echo "  would remove  $cli_target"
+    else
+      echo "  would install $cli_target"
+    fi
+  elif [ "$UNINSTALL" = 1 ]; then
+    if [ -L "$cli_target" ] || [ -f "$cli_target" ]; then
+      case "$(readlink "$cli_target" 2>/dev/null || true)" in
+        *session-time-machine*|*sessions.py*)
+          rm -f "$cli_target"
+          echo "  removed  $cli_target"
+          ;;
+      esac
+    fi
+  else
+    mkdir -p "$BIN_DIR"
+    chmod +x "$SRC/scripts/sessions.py"
+    ln -sfn "$SRC/scripts/sessions.py" "$cli_target"
+    echo "  installed $cli_target -> $SRC/scripts/sessions.py"
+    case ":$PATH:" in
+      *":$BIN_DIR:"*) ;;
+      *) echo "  NOTE: $BIN_DIR is not in your \$PATH. Add: export PATH=\"$BIN_DIR:\$PATH\"" ;;
+    esac
+  fi
+fi
+
 if [ "$DRYRUN" = 1 ]; then
   echo "dry run -- nothing changed."
   exit 0
@@ -271,5 +310,9 @@ else
   echo "installed $installed target(s)."
   echo
   echo "Try it:"
-  echo "  python3 $dest/scripts/sessions.py all --list 10"
+  if [ "$CLI" = 1 ] && [ -x "${XDG_BIN_HOME:-$HOME/.local/bin}/stm" ]; then
+    echo "  stm ls 10"
+  else
+    echo "  python3 $dest/scripts/sessions.py all --list 10"
+  fi
 fi

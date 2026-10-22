@@ -2988,20 +2988,23 @@ def _call_key(r):
     return tool, hashlib.sha1(c.encode("utf-8", "replace")).hexdigest()[:12]
 
 
-def _diff(tool, sid_a, sid_b, a, filt):
+def _diff(tool, sid_a, sid_b, a, filt, tool_b=None):
     """Compare two sessions: structure, modified tool calls, prompt drift."""
+    if tool_b is None:
+        tool_b = tool
     ra, _ = _load_rows(tool, sid_a, filt)
-    rb, _ = _load_rows(tool, sid_b, filt)
+    rb, _ = _load_rows(tool_b, sid_b, filt)
     if not ra or not rb:
         print("one of the sessions has no rows", file=sys.stderr)
         return
 
     ca, cb = counts(ra), counts(rb)
-    fa, fb = fidelity_report(ra, sid_a, tool), fidelity_report(rb, sid_b, tool)
+    fa, fb = fidelity_report(ra, sid_a, tool), fidelity_report(rb, sid_b, tool_b)
 
     out = []
     A = out.append
-    A(f"# DIFF - {tool}")
+    diff_name = f"{tool} vs {tool_b}" if tool != tool_b else tool
+    A(f"# DIFF - {diff_name}")
     A("")
     A(f"  A = {sid_a}   ({len(ra)} rows)")
     A(f"  B = {sid_b}   ({len(rb)} rows)")
@@ -3655,6 +3658,87 @@ def _do_search_scan(term, only=None):
     _notice("[agy: protobuf step_payload not searched; brain transcripts are searched]")
 
 
+_HUMAN_VERBS = {
+    "ls": "--list",
+    "list": "--list",
+    "recent": "--recent",
+    "peek": "--peek",
+    "summary": "--summary",
+    "diff": "--diff",
+    "handoff": "--handoff",
+    "search": "--search",
+    "find": "--search",
+    "grep": "--search",
+    "cat": "--transcript",
+    "transcript": "--transcript",
+    "tail": "--tail",
+    "preview": "--preview",
+    "json": "--json",
+    "jsonl": "--jsonl",
+    "md": "--md",
+    "export": "--export",
+    "status": "--index-status",
+    "reindex": "--reindex",
+}
+
+
+def _rewrite_human_argv(argv):
+    """Translate human ergonomic verbs into canonical [harness, flags...] shape."""
+    if not argv:
+        return ["all", "--list", "10"]
+    a = list(argv)
+    if a[0] in ("-h", "--help"):
+        return ["all", a[0]]
+    if a[0] in (HARNESSES + ["all"]):
+        h = a.pop(0)
+        if a and a[0] in _HUMAN_VERBS:
+            verb = _HUMAN_VERBS[a.pop(0)]
+            return [h, verb, *a]
+        return [h, *a]
+    if a[0] in _HUMAN_VERBS:
+        verb = _HUMAN_VERBS[a.pop(0)]
+        return ["all", verb, *a]
+    if a[0].startswith("-"):
+        return ["all", *a]
+    return ["all", *a]
+
+
+def _resolve_session(tool, sid):
+    """Auto-detect harness for sid if tool is 'all' or sid is not found in specified tool."""
+    if not sid:
+        return tool, sid
+    sid = str(sid).strip()
+    if sid.startswith("@session:"):
+        sid = sid[len("@session:"):]
+    if "/" in sid:
+        parts = sid.split("/", 1)
+        h = parts[0]
+        if h == "default":
+            h = "hermes"
+        if h in HARNESSES:
+            return h, parts[1]
+
+    if tool and tool != "all":
+        rows, _ = _get_rows(tool, sid)
+        if rows:
+            return tool, sid
+
+    # Probe all harnesses exact
+    for h in HARNESSES:
+        rows, _ = _get_rows(h, sid)
+        if rows:
+            return h, sid
+
+    # Prefix match across all harnesses
+    for h in HARNESSES:
+        ids = _all_session_ids(h)
+        for s in ids:
+            if s.startswith(sid):
+                return h, s
+
+    return ("hermes" if tool == "all" else tool), sid
+
+
 def main():
     global _REDACT, _FENCE, _INDEX_LIMIT
     ap = argparse.ArgumentParser(description="Universal AI conversation inspector.")
@@ -3727,7 +3811,9 @@ def main():
     ap.add_argument("--no-fence", dest="fence", action="store_false",
                     help="do NOT fence replayed content")
     ap.add_argument("--clip", type=int, metavar="N", help="truncate display body to N chars (explicit marker)")
-    a = ap.parse_args()
+    raw_args = sys.argv[1:]
+    rewritten_args = _rewrite_human_argv(raw_args)
+    a = ap.parse_args(rewritten_args)
     if a.redact is not None: _REDACT = a.redact
     if getattr(a, "index_limit", None) is not None:
         _INDEX_LIMIT = a.index_limit
@@ -3752,28 +3838,39 @@ def main():
         elif a.search:
             _do_search(a.harness, a.search, filt)
         elif a.peek:
-            if a.harness == "all": _notice("--peek requires a single harness"); return
-            _peek(a.harness, a.peek)
+            h, sid = _resolve_session(a.harness, a.peek)
+            _peek(h, sid)
         elif a.summary:
-            _summary(a.harness, a.summary, a, filt)
+            h, sid = _resolve_session(a.harness, a.summary)
+            _summary(h, sid, a, filt)
         elif a.diff:
-            _diff(a.harness, a.diff[0], a.diff[1], a, filt)
+            ha, sida = _resolve_session(a.harness, a.diff[0])
+            hb, sidb = _resolve_session(a.harness, a.diff[1])
+            _diff(ha, sida, sidb, a, filt, tool_b=hb)
         elif a.handoff:
-            _handoff(a.harness, a.handoff, a, filt)
+            h, sid = _resolve_session(a.harness, a.handoff)
+            _handoff(h, sid, a, filt)
         elif a.tail:
-            _render(a.harness, a.tail[0], "tail", a, filt)
+            h, sid = _resolve_session(a.harness, a.tail[0])
+            _render(h, sid, "tail", a, filt)
         elif a.transcript:
-            _render(a.harness, a.transcript[0], "transcript", a, filt)
+            h, sid = _resolve_session(a.harness, a.transcript[0])
+            _render(h, sid, "transcript", a, filt)
         elif a.preview:
-            _render(a.harness, a.preview[0], "preview", a, filt)
+            h, sid = _resolve_session(a.harness, a.preview[0])
+            _render(h, sid, "preview", a, filt)
         elif a.md:
-            _render(a.harness, a.md, "md", a, filt)
+            h, sid = _resolve_session(a.harness, a.md)
+            _render(h, sid, "md", a, filt)
         elif a.jsonl:
-            _render(a.harness, a.jsonl, "jsonl", a, filt)
+            h, sid = _resolve_session(a.harness, a.jsonl)
+            _render(h, sid, "jsonl", a, filt)
         elif a.json:
-            _render(a.harness, a.json, "json", a, filt)
+            h, sid = _resolve_session(a.harness, a.json)
+            _render(h, sid, "json", a, filt)
         elif a.export:
-            _render(a.harness, a.export, "export", a, filt)
+            h, sid = _resolve_session(a.harness, a.export)
+            _render(h, sid, "export", a, filt)
         else:
             _do_list(a.harness, 8, a)
     except FileNotFoundError as e:

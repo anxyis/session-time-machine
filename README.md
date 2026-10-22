@@ -39,7 +39,7 @@
 <br/>
 
 > [!TIP]
-> **One-liner install** — clones, detects every coding agent on your machine, drops the skill in place:
+> **One-liner install** — clones, detects every coding agent on your machine, drops the skill in place, and installs the `stm` CLI into `~/.local/bin/`:
 > ```bash
 > git clone https://github.com/anxyis/session-time-machine.git && cd session-time-machine && ./install.sh
 > ```
@@ -68,13 +68,15 @@ machine buries its history somewhere different:
 Seven databases, seven formats, seven schemas. Each one half-documented at best. Digging
 through them by hand is miserable.
 
-`session-time-machine` reads **all of them** through one CLI and hands you back the same
-shape every time.
+`session-time-machine` reads **all of them** through one command (`stm` or `python3 scripts/sessions.py`) and hands you back the same
+shape every time:
 
 ```bash
-python3 scripts/sessions.py all --list 20
-python3 scripts/sessions.py hermes --peek 20261021_102432_2b9b6f21
-python3 scripts/sessions.py codex --search "migration"
+stm ls 20
+stm peek 20261021_102432_2b9b6f21
+stm search "migration"
+stm diff id_A id_B
+stm handoff <id>
 ```
 
 <br/>

@@ -4,6 +4,7 @@ from collections import Counter
 # resolve sessions.py next to this file so the suite runs from any install location
 S = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sessions.py")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import sessions  # noqa: E402
 from sessions import safety_redact  # noqa: E402
 PY = sys.executable
 P=F=0
@@ -1139,9 +1140,31 @@ def main():
     check("audit: a dangling tool call is reported",
           "no result" in _un9, _un9[:80])
 
+    # ---- phase 5: human CLI ergonomics (stm) -------------------------
+    check("cli: bare argv rewrites to all --list",
+          sessions._rewrite_human_argv([]) == ["all", "--list", "10"])
+    check("cli: ls verb rewrites to --list",
+          sessions._rewrite_human_argv(["ls", "5"]) == ["all", "--list", "5"])
+    check("cli: peek verb rewrites to --peek",
+          sessions._rewrite_human_argv(["peek", "s1"]) == ["all", "--peek", "s1"])
+    check("cli: search verb rewrites to --search",
+          sessions._rewrite_human_argv(["search", "foo"]) == ["all", "--search", "foo"])
+    check("cli: diff verb rewrites to --diff",
+          sessions._rewrite_human_argv(["diff", "s1", "s2"]) == ["all", "--diff", "s1", "s2"])
+    check("cli: harness prefix preserved with verb",
+          sessions._rewrite_human_argv(["hermes", "peek", "s1"]) == ["hermes", "--peek", "s1"])
+    check("cli: legacy flags preserved",
+          sessions._rewrite_human_argv(["hermes", "--peek", "s1"]) == ["hermes", "--peek", "s1"])
+
+    _ha, _ = sessions._resolve_session("all", "@session:default/s1")
+    check("cli: resolve @session:default/ prefix to hermes", _ha == "hermes")
+    _hb, _ = sessions._resolve_session("all", "@session:codex/01a15ea2")
+    check("cli: resolve @session:codex/ prefix to codex", _hb == "codex")
+
     # cross-harness
     check("all --list exits 0", run("all","--list").returncode == 0)
     check("all --search exits 0", run("all","--search","the").returncode == 0)
+    check("cli stm ls exits 0", run("ls", "2").returncode == 0)
     print(f"\n=== {P} passed, {F} failed ===")
     sys.exit(0 if F == 0 else 1)
 

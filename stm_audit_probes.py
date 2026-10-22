@@ -20,7 +20,9 @@ REPO = os.path.dirname(os.path.abspath(__file__))
 LIVE = sys.argv[1] if len(sys.argv) > 1 else os.path.join(
     REPO, "skills", "session-time-machine", "scripts", "sessions.py")
 if not os.path.exists(LIVE):
-    LIVE = "/home/ubuntu/.hermes/skills/devops/session-time-machine/scripts/sessions.py"
+    # the dev tree, wherever it lives
+    _dev = os.path.expanduser("~/.hermes/skills/devops/session-time-machine")
+    LIVE = os.path.join(_dev, "scripts", "sessions.py")
 PY = sys.executable
 
 BUGS = []
@@ -268,7 +270,7 @@ SECRETS = [
     ('aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYzEXAMPLEKEY', "lowercase aws secret"),
     ('Authorization: Basic dXNlcjpwYXNzd29yZDEyMw==', "Authorization: Basic"),
     ('sk-proj-abcdefghijklmnopqrstuvwxyz1234', "sk-proj-"),
-    ("-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\n-----END", "unterminated PEM"),
+    ("-" * 5 + "BEGIN PRIVATE KEY" + "-" * 5 + "\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC", "unterminated PEM"),
 ]
 for payload, label in SECRETS:
     dbx, dx = tmpdb([("s1", "user", 1700000001, payload, None, None, None, None, None, None)])
@@ -295,30 +297,30 @@ probe("redaction does not mangle a normal word like 'disk-...'",
 # ---------------------------------------------------------------- 8
 print("\n== the --contains oracle ==")
 # a row whose content contains a secret, plus a filter that would drop it
-dbx, dx = tmpdb([("s1", "assistant", 1700000001, "ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789", None,
+dbx, dx = tmpdb([("s1", "assistant", 1700000001, "ghp_EXAMPLEKEYFORTESTSONLY0123456789", None,
                   None, None, None, None, None)])
-r = run(["hermes", "--json", "s1", "--contains", "ghp_AbCdEfGh"], env={"STM_HERMES_DB": dbx})
+r = run(["hermes", "--json", "s1", "--contains", "ghp_EXAMPLE"], env={"STM_HERMES_DB": dbx})
 out = r.stdout
 probe("--contains does not act as a prefix oracle for a secret",
-      "ghp_AbCdEfGh" not in out, "prefix revealed")
-r = run(["hermes", "--json", "s1", "--contains", "ghp_AbCdEfGZ"], env={"STM_HERMES_DB": dbx})
+      "ghp_EXAMPLE" not in out, "prefix revealed")
+r = run(["hermes", "--json", "s1", "--contains", "ghp_OTHERXX"], env={"STM_HERMES_DB": dbx})
 probe("--contains on a non-matching prefix returns nothing",
-      "ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789" not in r.stdout, "secret leaked")
+      "ghp_EXAMPLEKEYFORTESTSONLY0123456789" not in r.stdout, "secret leaked")
 
 # ---------------------------------------------------------------- 9
 print("\n== search/peek redaction ==")
-dbx, dx = tmpdb([("s1", "user", 1700000001, "the key is ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789 ok",
+dbx, dx = tmpdb([("s1", "user", 1700000001, "the key is ghp_EXAMPLEKEYFORTESTSONLY0123456789 ok",
                   None, None, None, None, None, None)])
 r = run(["hermes", "--search", "key"], env={"STM_HERMES_DB": dbx})
 probe("--search output is redacted",
-      "ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789" not in r.stdout, "secret in --search")
+      "ghp_EXAMPLEKEYFORTESTSONLY0123456789" not in r.stdout, "secret in --search")
 r = run(["hermes", "--peek", "s1"], env={"STM_HERMES_DB": dbx})
 probe("--peek output is redacted",
-      "ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789" not in r.stdout, "secret in --peek")
+      "ghp_EXAMPLEKEYFORTESTSONLY0123456789" not in r.stdout, "secret in --peek")
 
 # ---------------------------------------------------------------- 10
 print("\n== quadratic regex ==")
-dbx, dx = tmpdb([("s1", "user", 1700000001, "-----BEGIN RSA PRIVATE KEY-----\n" + "A" * 270000,
+dbx, dx = tmpdb([("s1", "user", 1700000001, "-" * 5 + "BEGIN RSA PRIVATE KEY" + "-" * 5 + "\n" + "A" * 270000,
                   None, None, None, None, None, None)])
 import time
 t0 = time.time()
@@ -413,7 +415,8 @@ probe("ro()'s retry does not skip the exception",
 print("\n== installer ==")
 inst = os.path.join(REPO, "install.sh")
 if not os.path.exists(inst):
-    inst = "/home/ubuntu/.hermes/skills/devops/session-time-machine/install.sh"
+    inst = os.path.join(os.path.expanduser("~/.hermes/skills/devops/session-time-machine"),
+                         "install.sh")
 if os.path.exists(inst):
     isrc = open(inst, encoding="utf-8").read()
     # the guard must compare resolved paths, not logical ones

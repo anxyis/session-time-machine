@@ -17,7 +17,7 @@ python3 $S hermes --peek <ID>                 # size + fidelity before loading
 python3 $S hermes --jsonl <ID> | head -40     # chunkable, content=null where lost
 python3 $S hermes --md <ID>                   # full, for read_file(offset=N)
 ```
-Tests: `python3 scripts/test_sessions.py` → **116/116 green** (live) · **91/91** (fixture corpus, `tests/run_fixtures.sh`), all against live databases (no mocks). Re-run after any harness change.
+Tests: `python3 scripts/test_sessions.py` → **275/275 green** (live) · **272/272** (fixture corpus, `tests/run_fixtures.sh`), all against live databases (no mocks). Re-run after any harness change.
 
 ## Normalized row (one shape for every harness)
 ```
@@ -27,7 +27,7 @@ Tests: `python3 scripts/test_sessions.py` → **116/116 green** (live) · **91/9
 `kind` ∈ `message | tool_call | tool_output | reasoning | empty | lifecycle | error | attachment`.
 `content` is **always** the verbatim string or `null` (never `""`, never invented).
 
-`role` follows the harness's own convention, consistently across all five: `user` = the human, `assistant` = the model's own prose/reasoning/tool_call, `developer` = injected system context, `system` = lifecycle/error rows, **`tool` = every `tool_output` row**. A tool result is never `role=assistant` — that mislabel makes a transcript read as if the model had narrated the tool output.
+`role` follows the harness's own convention, consistently across all seven: `user` = the human, `assistant` = the model's own prose/reasoning/tool_call, `developer` = injected system context, `system` = lifecycle/error rows, **`tool` = every `tool_output` row**. A tool result is never `role=assistant` — that mislabel makes a transcript read as if the model had narrated the tool output.
 
 ### The one hallu­ci­nation trap the tagger prevents
 An assistant turn that invoked tools has `content==null` (its payload is the tool call, not prose). The tagger labels it instead of leaving a blank `[assistant]` line:
@@ -86,16 +86,35 @@ The tail is token-budgeted (`--handoff-budget`, default 4000) and keeps the **en
 
 ## Commands (all harnesses)
 ```
-harness = hermes|opencode|cline|codex|agy|all
+harness = hermes|opencode|cline|codex|agy|omp|pi|all
 python3 $S <harness> --list [N]
 python3 $S <harness> --peek ID
 python3 $S <harness> --transcript ID [N] | --tail ID N | --preview ID [N]
 python3 $S <harness> --md ID | --jsonl ID | --json ID
 python3 $S <harness> --export ID --out FILE --format md|jsonl|json|txt
 python3 $S <harness> --search TERM
-python3 $S <harness> --logs N          # agy run logs only
+python3 $S <harness> --path ID        # raw file/db on disk
+python3 $S all --harnesses            # detected harnesses + counts + storage
+python3 $S all --logs N               # agy run logs only
 ```
-`all --list` and `all --search TERM` fan out across Hermes/OpenCode/Cline/Codex/Agy. Unsupported combos exit non-zero with a message instead of silent no-ops.
+`all --list` and `all --search TERM` fan out across all seven harnesses. Unsupported combos exit non-zero with a message instead of silent no-ops.
+
+### The human verb layer (`stm` on PATH)
+`install.sh --cli` symlinks this script to `~/.local/bin/stm`, which accepts ergonomic verbs instead of flags. Same engine, same output — prefer `stm` when driving a terminal, `$S <harness> --flag` when the canonical form is clearer.
+```
+stm ls [N]              stm peek <id|last>      stm cat <id|last>
+stm tail <id|last> [N]  stm preview <id|last>   stm search <query>
+stm summary <id|last>   stm diff <id1> <id2>    stm handoff <id|last>
+stm path <id|last>      stm harnesses           stm version
+stm status              stm reindex             stm completion bash|zsh|fish
+```
+Prefix a harness to scope it: `stm codex tail last 5`. Bare `stm` == `stm ls 10`.
+
+### Session-id resolution
+- **`last`** (aliases `@last`, `latest`, `-1`) resolves to the newest session, globally or within the given harness. It honours `--source`, so it never returns a session `stm ls` would have hidden (default scope excludes `cron`; use `--source cron` / `--source all`).
+- **Prefixes** work when unique. A prefix matching two sessions exits **2** as ambiguous — never a coin flip. Pass ≥8 chars or a full id.
+- **A miss exits 2** with `error: no session matching '<id>'` on stderr and empty stdout, for every id-taking verb. Never assume a zero-message session means success. `stm codex peek <hermes-id>` is a miss, not a cross-harness fallback.
+- `@session:<harness>/<id>` and `<harness>/<id>` are accepted (the form `--handoff` emits).
 
 ## Composable filters (AND semantics; applied before printing)
 Filters SELECT rows only — they never mutate a row, so a surviving row is identical with or without filters. Active filters are reported on stderr; stdout stays machine-parseable.
@@ -202,8 +221,8 @@ Run: `python3 scripts/test_sessions.py` (live data) or `bash tests/run_fixtures.
 `tests/fixtures/` holds one synthetic session per harness, built to the real schema
 (hermes/opencode/cline DBs, a codex rollout with the real `custom_tool_call` shape, an
 agy brain transcript + `gen_metadata` protobuf, and the shared omp/pi event jsonl). The
-fixture suite (109 checks) needs no harness installed and no personal data. The live
-suite (116 checks) asserts the same invariants against real sessions. CI runs the
+fixture suite (272 checks) needs no harness installed and no personal data. The live
+suite (275 checks) asserts the same invariants against real sessions. CI runs the
 fixture suite, the installer self-test, the bash-3.2 check, and a secret scan.
 
 `tests/captures/` holds SANITIZED REAL captures -- actual sessions, secrets

@@ -11,8 +11,8 @@
   <img src="https://img.shields.io/badge/deps-none-5865F2" alt="No dependencies" />
   <img src="https://img.shields.io/badge/harnesses-7-ff69b4" alt="7 harnesses" />
   <img src="https://github.com/anxyis/session-time-machine/actions/workflows/test.yml/badge.svg?branch=main" alt="CI" />
-  <img src="https://img.shields.io/badge/fixture%20suite-91%2F91-4CAF50" alt="91/91 fixture tests" />
-  <img src="https://img.shields.io/badge/live%20suite-98%2F98-4CAF50" alt="98/98 live tests" />
+  <img src="https://img.shields.io/badge/fixture%20suite-272%2F272-4CAF50" alt="272/272 fixture tests" />
+  <img src="https://img.shields.io/badge/live%20suite-275%2F275-4CAF50" alt="275/275 live tests" />
 </p>
 
 <br/>
@@ -94,17 +94,40 @@ stm handoff <id>
 | `stm summary ID` | `--summary ID` | session shape, token footprint & tool usage (~1.5 KB) |
 | `stm diff ID_A ID_B`| `--diff ID_A ID_B` | structural comparison, tool changes, prompt drift |
 | `stm handoff ID` | `--handoff ID` | pack intent, unfinished calls & budgeted tail to resume |
+| `stm path ID` | `--path ID` | print the raw file/db path (`code $(stm path last)`) |
+| `stm harnesses` | `--harnesses` | which harnesses are detected, session counts, storage |
 | `stm status` | `--index-status` | local search index status |
-| `stm completion B` | `--completion B` | shell completions for `bash`, `zsh`, or `fish` |
+| `stm version` | `--version` / `-v` | print the version |
+| `stm completion SHELL` | `--completion SHELL` | shell completions for `bash`, `zsh`, or `fish` |
 | — | `--jsonl` / `--json` / `--md` | lossless machine-readable or markdown stream |
 | — | `--export ID --out F` | write session to a file (`0600` permissions) |
+
+Every command that takes an id also accepts **`last`** (aliases `@last`, `latest`, `-1`) instead of
+one, globally or scoped to a harness:
+
+```bash
+stm peek last            # newest session on this box
+stm codex tail last 5    # newest codex session, last 5 rows
+stm handoff last
+```
+
+`last` honours `--source`, so it always agrees with what `stm ls` showed you. With `--source`
+unset, cron sessions are hidden — pass `--source cron` or `--source all` to reach them.
+
+Ids may be full, or a prefix long enough to be unique. A prefix matching two sessions is an
+**error**, not a coin flip:
+
+```bash
+stm peek doesnotexist123
+# error: no session matching 'doesnotexist123'; try stm ls, or pass a longer prefix   (exit 2)
+```
 
 Filters stack with AND semantics — pick the ones you want:
 
 ```bash
 --role user,assistant   --kind message,tool_call   --model <substr>
 --provider <substr>     --contains <text>          --tool <name>
---errors                --since 7d  --until 3d  --date 2026-10-21
+--errors                --since 7  --until 3  --date 2026-10-21   # days, integers
 ```
 
 And the one that actually saves your tokens:
@@ -242,7 +265,7 @@ alone, so you don't get a wall of false alarms.
 > **Redaction is best-effort, not a guarantee.** It matches *shapes* it
 > recognises; a secret in an unusual format, a base64 blob, a bare
 > high-entropy string with no label — those get through. Treat `--export`
-> output as still sensitive. `--raw` gives you the unredacted bytes.
+> output as still sensitive. `--no-redact` gives you the unredacted bytes.
 
 ```bash
 # redacted by default
@@ -322,7 +345,7 @@ you run twice a month. Python's already there. Works on a Raspberry Pi, a contai
 laptop, whatever.
 
 #### Does it work on Windows / macOS?
-Paths are `~`-relative and it uses `pathlib` throughout, so yes. The test suite was
+Paths are `~`-relative throughout, so yes. The test suite was
 developed and verified on Linux.
 
 <br/>
@@ -333,7 +356,9 @@ developed and verified on Linux.
 - **More harnesses** — Windsurf, Aider, Goose, and whatever else shows up with a weird
   enough storage format to be interesting.
 
-Already built, if you missed them: `--summary` (the shape of a session without reading it),
+Already built, if you missed them: the human `stm` verb layer (`ls`/`peek`/`cat`/`tail`/
+`search`/`path`/`harnesses`/`version`, shell completions, auto-paging), `last` as a session-id
+shortcut, `--summary` (the shape of a session without reading it),
 `--diff` (two sessions compared), `--handoff` (the pack you paste into a fresh session),
 and the local **FTS5 index** (`--reindex`) that makes `--search` ~20x faster.
 
@@ -351,7 +376,7 @@ python3 skills/session-time-machine/scripts/test_sessions.py
 bash tests/run_fixtures.sh
 ```
 
-The **fixture suite** (109 checks) runs against a small synthetic corpus in
+The **fixture suite** (272 checks) runs against a small synthetic corpus in
 `tests/fixtures/` — one hand-written session per harness, built to the real
 schema. No mocks, no personal transcripts, no secrets, no harness installs.
 It's what CI runs on every push, and what you can run to check the tool still
@@ -364,7 +389,7 @@ the harness version recorded in `VERSIONS.json`. Those test the format
 itself, not someone's idea of it. CI scans them for leaks on every push
 (verified against a planted one).
 
-The **live suite** (116 checks) does the same assertions against your actual
+The **live suite** (275 checks) does the same assertions against your actual
 sessions — it discovers a real session per harness at runtime, and checks the
 sanitized captures. Stronger, but only works on a machine where those
 harnesses are installed.

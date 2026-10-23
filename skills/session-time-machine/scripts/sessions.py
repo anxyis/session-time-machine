@@ -35,7 +35,7 @@ Filters (composable, AND-ed; apply to any row-producing command):
   --include-lifecycle show internal lifecycle rows (hidden by default)
   --clip N            truncate display body to N chars with an explicit marker
 """
-import argparse, collections, json, sqlite3, sys, os, glob, datetime, signal, re
+import argparse, collections, json, sqlite3, sys, os, glob, datetime, signal, re, subprocess
 __version__ = "0.2.0"
 # SIGPIPE does not exist on Windows, and setting it unguarded made the
 # import fail there -- while the README says Windows works.

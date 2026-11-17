@@ -75,6 +75,50 @@ _FENCE = True
 _SOURCE = None
 _REDACT_COUNTS = {}
 
+# ---- load safety: size gate (written 2026-10-26, finished 2026-11-17) ----
+# One 486 MB cline transcript inflated past 1 GB of anon-rss (raw string +
+# json.loads graph + normalized rows all live at once) and OOM-killed an
+# embedded caller's service three times in 45 minutes. Loading is what
+# exhausts memory, so the gate is a cheap PRE-LOAD size check:
+#   _MAX_SESSION_MB  refuse to load a session whose raw data is bigger
+#                    (STM_MAX_SESSION_MB, default 100 MB; 0 disables).
+#                    Refusal is exit 3 plus one parseable stderr line,
+#                    never a traceback.
+#   --path           still works for a refused session: it prints where the
+#                    raw storage lives so the caller can read it in chunks.
+# The gate has to sit on EVERY path that loads a whole session, including
+# the linear fallback in cline_search. Guarding only _get_rows leaves the
+# search path -- the one that actually OOMed -- wide open, which is how the
+# first attempt at this fix shipped a guard that guarded nothing.
+def _mb_from_env(var, default=None):
+    v = os.environ.get(var)
+    if v is None:
+        return default
+    try:
+        n = int(v)
+        return n if n >= 0 else default
+    except ValueError:
+        return default
+
+_MAX_SESSION_MB = _mb_from_env("STM_MAX_SESSION_MB", 100)
+
+
+class _SessionTooLarge(Exception):
+    """Raised BEFORE a session is loaded, when its raw size exceeds the
+    gate. Loading inflates raw bytes several-fold in RAM, so refusing with
+    a clean, parseable error is cheaper than dying mid-parse."""
+    def __init__(self, tool, sid, size):
+        self.tool, self.sid, self.size = tool, sid, size
+        super().__init__(f"{tool}/{sid}: {size} bytes")
+
+    def message(self):
+        return (
+            f"stm: session too large to load safely: {self.size / 1e6:.1f} MB raw "
+            f"> limit {_MAX_SESSION_MB} MB ({self.tool}/{self.sid}).\n"
+            f"     loading it inflates several-fold in memory. options:\n"
+            f"       stm {self.tool} --path {self.sid}    print the raw file (read it in chunks)\n"
+            f"       STM_MAX_SESSION_MB=0                  lift the limit (needs RAM to spare)")
+
 def ro(path):
     """Open a sqlite DB strictly read-only via URI. Raises FileNotFoundError if absent.
 
@@ -989,12 +1033,32 @@ def cline_search(term):
     """
     db = ro(CLINEDB)
     try:
-        sids = [r[0] for r in db.execute("select session_id from sessions").fetchall()]
+        # messages_path comes along so the size gate below can check the raw
+        # file WITHOUT opening the db again per session.
+        entries = db.execute("select session_id, messages_path from sessions").fetchall()
     except sqlite3.Error:
         return
+    base = os.path.dirname(os.path.abspath(CLINEDB))
+    limit = _MAX_SESSION_MB * 1024 * 1024 if _MAX_SESSION_MB else None
     needle = term.lower()
     hits = 0
-    for sid in sids:
+    skipped = 0
+    for sid, mp in entries:
+        # THE GATE THAT MATTERS: the fallback scan used to load every cline
+        # session through the adapter, including the 486 MB one -- that is the
+        # exact read that OOM-killed a caller. Check the raw size first and
+        # say what was skipped; never load it.
+        if limit:
+            f = mp if (mp and os.path.isabs(mp)) else (os.path.join(base, mp) if mp else None)
+            try:
+                size = os.path.getsize(f) if (f and os.path.isfile(f)) else None
+            except OSError:
+                size = None
+            if size is not None and size > limit:
+                _notice(f"skipped {sid}: {size / 1e6:.1f} MB raw > limit "
+                        f"{_MAX_SESSION_MB} MB (STM_MAX_SESSION_MB=0 lifts the gate)")
+                skipped += 1
+                continue
         try:
             rows, info = _cline_rows(sid)
         except Exception:
@@ -1009,8 +1073,11 @@ def cline_search(term):
                 break
         if hits >= 12:
             break
+    if skipped:
+        _notice(f"({skipped} session(s) skipped as too large -- results are incomplete)")
     if not hits:
-        print("(no matches)", file=sys.stderr)
+        print("(no matches)" if not skipped else
+              "(no matches in the sessions small enough to scan)", file=sys.stderr)
 
 
 
@@ -2559,12 +2626,101 @@ def safety_apply_fence(text, enabled=True, kind="session transcript"):
     # NameError on every call.
     return f"{safety_fence_header(kind)}\n{text}\n{safety_fence_footer()}"
 
+# ---------- load safety: size gate ----------
+
+def _session_size(tool, sid):
+    """Cheap on-disk size (bytes) of a session's raw data, or None if
+    unknown. Runs BEFORE any load, so the size gate never materializes the
+    very thing it guards against."""
+    try:
+        if tool == "hermes":
+            db = ro(HB)
+            r = db.execute(
+                "select sum(length(coalesce(content,''))"
+                " + length(coalesce(reasoning_content,''))"
+                " + length(coalesce(tool_calls,''))"
+                " + length(coalesce(api_content,'')))"
+                " from messages where session_id=?", (sid,)).fetchone()
+            return r[0]
+        if tool == "opencode":
+            db = ro(ODB)
+            t = _oc_tables(db)
+            if _oc_schema_of(db, sid) == "v2" and t["v2msg"]:
+                # v2 keeps the whole message (role + parts) inline in one data blob
+                r = db.execute("select sum(length(data)) from session_message "
+                               "where session_id=?", (sid,)).fetchone()
+                return r[0]
+            r = db.execute(
+                "select (select sum(length(p.data)) from part p"
+                "         join message m on m.id = p.message_id"
+                "         where m.session_id = ?)"
+                "      + (select sum(length(data)) from message"
+                "         where session_id = ?)", (sid, sid)).fetchone()
+            return r[0]
+        if tool == "cline":
+            db = ro(CLINEDB)
+            r = db.execute("select messages_path from sessions where session_id=?",
+                           (sid,)).fetchone()
+            if r and r[0]:
+                mp = r[0]
+                if not os.path.isabs(mp):
+                    mp = os.path.join(os.path.dirname(os.path.abspath(CLINEDB)), mp)
+                if os.path.isfile(mp):
+                    return os.path.getsize(mp)
+            return None
+        if tool == "codex":
+            f = _codex_file(sid)
+            if f and os.path.isfile(f):
+                return os.path.getsize(f)
+            return None
+        if tool == "agy":
+            tp = os.path.join(AGY_BRAIN, sid, ".system_generated", "logs",
+                              "transcript_full.jsonl")
+            if os.path.isfile(tp):
+                return os.path.getsize(tp)
+            dbp = os.path.join(AGY_DIR, sid + ".db")
+            if os.path.isfile(dbp):
+                return os.path.getsize(dbp)
+            return None
+        if tool in ("omp", "pi"):
+            _h, p = omp_find_session(sid)
+            if p and os.path.isfile(p):
+                return os.path.getsize(p)
+            return None
+    except Exception:
+        return None
+    return None
+
+
+def _over_limit(tool, sid):
+    """Raw size of a session that exceeds the load gate, else None.
+
+    Returns the byte count so callers can report it instead of loading it.
+    A None from _session_size means "size unknown" (never a refusal) -- the
+    gate must not block a session just because it could not be measured.
+    """
+    if not _MAX_SESSION_MB:
+        return None
+    size = _session_size(tool, sid)
+    if size is not None and size > _MAX_SESSION_MB * 1024 * 1024:
+        return size
+    return None
+
+
+def _gate_session_size(tool, sid):
+    """Refuse to load an oversized session. Called at the top of _get_rows."""
+    size = _over_limit(tool, sid)
+    if size is not None:
+        raise _SessionTooLarge(tool, sid, size)
+
+
 # ---------- dispatch + argparse + entry point ----------
 # NOTE: the harness positional is dest="harness" (NOT a "tool" attribute) so it
 # never collides with the --tool content filter.
 
 def _get_rows(tool, sid):
     """Fetch normalized rows + info for a session id."""
+    _gate_session_size(tool, sid)
     if tool == "hermes":
         rows = _hermes_rows(sid)
         info = {"harness": "hermes", "source": sid}
@@ -3424,6 +3580,11 @@ def _index_rebuild(a, force=False, quiet=False):
             for sid in sids:
                 try:
                     rows, _info = _load_rows(harness, sid, _NoFilter())
+                except _SessionTooLarge:
+                    # too big to index; counting it keeps the index honest
+                    # instead of silently omitting the session.
+                    n_skipped += 1
+                    continue
                 except Exception:
                     continue
                 if not rows:
@@ -3501,8 +3662,9 @@ def _index_rebuild(a, force=False, quiet=False):
         con.commit()
         total = con.execute("select count(*) from rows_fts").fetchone()[0]
         if not quiet:
+            extra = (f", {n_skipped} skipped as too large" if n_skipped else "")
             print(f"index: {total} rows from {n_sess} sessions "
-                  f"(+{n_new} new, ~{n_changed} changed, -{n_removed} removed) "
+                  f"(+{n_new} new, ~{n_changed} changed, -{n_removed} removed{extra}) "
                   f"-> {path_short(_index_path())}", file=sys.stderr)
         return total, n_sess
     finally:
@@ -4122,7 +4284,7 @@ def _resolve_last(tool="all"):
 
 def _session_path(tool, sid):
     """Print the exact filesystem path to the raw storage file/db for a session."""
-    h, resolved_sid = _resolve_session(tool, sid)
+    h, resolved_sid = _resolve_session(tool, sid, load=False)
     path = ""
     if h == "hermes":
         path = os.path.expanduser(HB)
@@ -4192,8 +4354,13 @@ def _show_harnesses():
         print(f"{h:<12} {status:<10} {count:<10} {display_path}")
 
 
-def _resolve_session(tool, sid):
-    """Auto-detect harness for sid if tool is 'all' or sid is not found in specified tool."""
+def _resolve_session(tool, sid, load=True):
+    """Auto-detect harness for sid if tool is 'all' or sid is not found in specified tool.
+
+    load=False resolves the id WITHOUT loading the session -- needed by --path,
+    which must still work for a session the size gate refuses. Loading it there
+    would defeat the gate and re-create the OOM the gate exists to prevent.
+    """
     if not sid or not str(sid).strip():
         print("error: empty session id", file=sys.stderr)
         sys.exit(2)
@@ -4222,8 +4389,11 @@ def _resolve_session(tool, sid):
 
     # 1. Exact match across pool
     for h in pool:
-        rows, _ = _get_rows(h, sid)
-        if rows:
+        if load:
+            rows, _ = _get_rows(h, sid)
+            if rows:
+                return h, sid
+        elif sid in set(_all_session_ids(h)):
             return h, sid
 
     # 2. Prefix match across pool
@@ -4434,6 +4604,18 @@ harnesses:
             _do_list(a.harness, 8, a)
     except BrokenPipeError:
         pass
+    except _SessionTooLarge as e:
+        # exit 3: refused BEFORE loading, so nothing was inflated and nothing
+        # was killed. --path still works for this session.
+        print(e.message(), file=sys.stderr); sys.exit(3)
+    except MemoryError:
+        # exit 4: the last-resort backstop. Without it a runaway allocation is
+        # an uncaught traceback, and the caller sees a crash instead of a
+        # reason.
+        print("stm: out of memory while loading a session -- it is too big to "
+              "hold in RAM.\n"
+              "     use `stm <harness> --path <id>` to locate the raw file and "
+              "read it in chunks.", file=sys.stderr); sys.exit(4)
     except FileNotFoundError as e:
         print(f"db/directory not found: {e.filename or e}", file=sys.stderr); sys.exit(1)
     except sqlite3.Error as e:

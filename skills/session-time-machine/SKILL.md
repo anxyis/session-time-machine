@@ -17,10 +17,10 @@ python3 $S hermes --peek <ID>                 # size + fidelity before loading
 python3 $S hermes --jsonl <ID> | head -40     # chunkable, content=null where lost
 python3 $S hermes --md <ID>                   # full, for read_file(offset=N)
 ```
-Tests: `python3 scripts/test_sessions.py` → **286 checks** (live) · **283/283** (fixture corpus, `tests/run_fixtures.sh`, what CI runs), all against live databases (no mocks). Re-run after any harness change.
-On a box with every harness installed, 280 of the 286 live checks pass; the other 6 are
-**environment gaps, not reader bugs** (omp has no sessions with tool outputs; one agy
-usage-ratio assertion) and fail identically with or without the v2 reader.
+Tests: `python3 scripts/test_sessions.py` → **296 checks** (live: 290 pass) · **293/293** (fixture corpus, `tests/run_fixtures.sh`, what CI runs), all against live databases (no mocks). Re-run after any harness change.
+The 6 live failures are **environment gaps, not reader bugs** (omp has no sessions with
+tool outputs on this box; one agy usage-ratio assertion) and fail identically with or
+without the v2 reader and the size gate.
 
 ## Normalized row (one shape for every harness)
 ```
@@ -117,6 +117,7 @@ Prefix a harness to scope it: `stm codex tail last 5`. Bare `stm` == `stm ls 10`
 - **`last`** (aliases `@last`, `latest`, `-1`) resolves to the newest session, globally or within the given harness. It honours `--source`, so it never returns a session `stm ls` would have hidden (default scope excludes `cron`; use `--source cron` / `--source all`).
 - **Prefixes** work when unique. A prefix matching two sessions exits **2** as ambiguous — never a coin flip. Pass ≥8 chars or a full id.
 - **A miss exits 2** with `error: no session matching '<id>'` on stderr and empty stdout, for every id-taking verb. Never assume a zero-message session means success. `stm codex peek <hermes-id>` is a miss, not a cross-harness fallback.
+- **A session too big to load exits 3**, `out of memory during the load` exits 4 — both with a message on stderr and empty stdout, never a traceback. `STM_MAX_SESSION_MB` (default **100**, `0` disables) is the pre-load size gate: it refuses a session whose raw data is bigger instead of inflating it in RAM. `--path` still works for a refused session, so the caller can read the raw file in chunks. This exists because one 486 MB cline transcript took an embedded caller's whole service down three times; see the gotcha below.
 - `@session:<harness>/<id>` and `<harness>/<id>` are accepted (the form `--handoff` emits).
 
 ## Composable filters (AND semantics; applied before printing)
@@ -155,6 +156,11 @@ Each harness's data root can be overridden, which is what lets the test suite ru
 against a fixture corpus instead of live data:
 `STM_HERMES_DB`, `STM_OPENCODE_DB`, `STM_CLINE_DB`, `STM_CODEX_DIR`, `STM_AGY_BRAIN`,
 `STM_AGY_DIR`, `STM_OMP_SESSIONS`, `STM_PI_SESSIONS`. See `tests/run_fixtures.sh`.
+
+Load safety: `STM_MAX_SESSION_MB` (default `100`, `0` disables) is a pre-load size
+gate — a session whose raw data is bigger is refused with exit 3 rather than
+inflated in RAM. It applies to every path that loads a whole session, including
+the linear search fallback; `--path` still resolves a refused session.
 
 ## Harness coverage (verified 2026-10-22)
 | Capability | Hermes | OpenCode | Cline | Codex | Agy | Omp | Pi |
@@ -207,6 +213,7 @@ a 2.8M-char dump into an agent's context is what killed the 2026-10-21 session.
 - **`last` respects `--source`, so it agrees with `ls`.** `last` resolves to the newest session *within the current source filter*, not the newest overall. Default (`--source` unset) hides `cron`, so `stm peek last` will not hand you a cron run; use `--source cron` for those or `--source all` for everything regardless. This is a fix for the earlier divergence where `--source cli last` could return an excluded cron session.
 - **The installed skill copies are copies, not symlinks.** `install.sh` rsync-style copies `skills/session-time-machine/` into every agent's skills dir (`~/.hermes/skills/devops/…`, `~/.codex/skills/…`, `~/.config/opencode/skills/…`, and the rest of the `AGENTS` list). Editing the repo checkout does **not** update the copy an agent actually loads; the `stm` CLI on `PATH` is a symlink to the repo, so the two can drift. After changing the repo, either re-run `./install.sh --agent hermes-agent` or `cp -p` the touched files into the loaded copy, then diff to confirm.
 - **A harness can change its schema without changing its name, and a reader that knows only the old shape fails SILENTLY.** opencode 1.19 started writing new sessions to `session_v2` + `session_message` (parts inline in `data.content`) and left the legacy `session`/`message`/`part` tables holding only the old ones. The reader still pointed at the legacy tables, so it listed nothing new, loaded nothing new, `last` resolved to a month-old session, and the FTS index skipped every session created since the upgrade — with **no error anywhere**. It looked exactly like "there are no sessions". The tell: `stm <harness> --list` newest-first should have today's date at the top. **Check the newest row's date first** whenever a harness reports nothing. Every path that touches a harness's session registry must read *all* the schemas that registry has, from ONE shared helper — a per-path `select … from session` is how the gap survives a refactor.
+- **A guard on one entry point guards nothing.** The load-size gate was first written into `_get_rows`, which is where `peek`/`summary`/`tail`/`export`/the indexer all arrive — it looked complete and its docstring promised `exit 3`. But the OOM it was written for entered through `cline_search` → `_cline_rows`, a direct load that never touches `_get_rows`, so the guard could not fire on the only path that had ever crashed. Before trusting any gate, **enumerate the call sites of the primitive** (`grep -n '_cline_rows('`) and then **prove it by tripping it** (`STM_MAX_SESSION_MB=1 stm opencode --peek <id>` — you should get exit 3, one stderr line, no traceback). Reading the diff tells you what the author intended; forcing the limit tells you what the code does. Same rule for the memory-safety exit codes: a docstring saying "exit 3" is not an `except` clause.
 - **Docs drift faster than the code, and the drift is always in the same direction: numbers too low, flags invented.** A 2026-10-23 audit found README advertising a `--raw` flag that never existed (the real one is `--no-redact`, stated 7 lines later), claiming `pathlib` where the code uses `os.path` 94x, showing `--since 7d` when the arg is `type=int`, test counts ~2.5x stale, and SKILL.md listing 6 harnesses with omp/pi missing plus none of the human verbs. Sweep before any release with: `grep -nE '\b(91|98|109|116)\b|--raw|pathlib|all five' README.md skills/*/SKILL.md`, and check every advertised flag exists — `for f in --path --harnesses …; do grep -q "\"$f\"" scripts/sessions.py || echo "MISSING $f"; done`. Re-run both suites and take the counts from the actual output, never from the last time you looked.
 
 ## Testing
@@ -228,8 +235,8 @@ Run: `python3 scripts/test_sessions.py` (live data) or `bash tests/run_fixtures.
 `tests/fixtures/` holds one synthetic session per harness, built to the real schema
 (hermes/opencode/cline DBs, a codex rollout with the real `custom_tool_call` shape, an
 agy brain transcript + `gen_metadata` protobuf, and the shared omp/pi event jsonl). The
-fixture suite (283 checks) needs no harness installed and no personal data. The live
-suite (286 checks) asserts the same invariants against real sessions. CI runs the
+fixture suite (293 checks) needs no harness installed and no personal data. The live
+suite (296 checks) asserts the same invariants against real sessions. CI runs the
 fixture suite, the installer self-test, the bash-3.2 check, and a secret scan.
 
 `tests/captures/` holds SANITIZED REAL captures -- actual sessions, secrets

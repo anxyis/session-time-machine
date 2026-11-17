@@ -11,8 +11,8 @@
   <img src="https://img.shields.io/badge/deps-none-5865F2" alt="No dependencies" />
   <a href="#problem"><img src="https://img.shields.io/badge/harnesses-7-ff69b4" alt="7 harnesses" /></a>
   <a href="https://github.com/anxyis/session-time-machine/actions/workflows/test.yml"><img src="https://github.com/anxyis/session-time-machine/actions/workflows/test.yml/badge.svg?branch=main" alt="CI" /></a>
-  <a href="#development"><img src="https://img.shields.io/badge/fixture%20suite-283%2F283-4CAF50" alt="283/283 fixture tests" /></a>
-  <a href="#development"><img src="https://img.shields.io/badge/live%20suite-286%20checks-4CAF50" alt="286 live checks" /></a>
+  <a href="#development"><img src="https://img.shields.io/badge/fixture%20suite-293%2F293-4CAF50" alt="293/293 fixture tests" /></a>
+  <a href="#development"><img src="https://img.shields.io/badge/live%20suite-296%20checks-4CAF50" alt="296 live checks" /></a>
 </p>
 
 <br/>
@@ -177,6 +177,14 @@ stm peek doesnotexist123
 
 **For scripts:** a bad id exits **2**, message on stderr, **nothing on stdout**, for every
 id-taking verb. A zero-message session is not a success — check the exit code.
+
+Two more terminal codes, same contract (message on stderr, empty stdout, never a
+traceback): **3** = the session is too big to load safely, **4** = the load ran out of
+memory anyway. `STM_MAX_SESSION_MB` (default **100**, `0` disables) is the pre-load size
+gate. It sits on every path that loads a whole session — including the linear search
+fallback, which is where a 486 MB cline transcript once took an embedded caller's
+service down three times. `stm <harness> --path <id>` still works for a refused session,
+so you can locate the raw file and read it in chunks.
 
 <a id="filters"></a>
 
@@ -543,7 +551,7 @@ python3 skills/session-time-machine/scripts/test_sessions.py
 bash tests/run_fixtures.sh
 ```
 
-**fixture suite** (283 checks) runs against a small synthetic corpus in
+**fixture suite** (293 checks) runs against a small synthetic corpus in
 [`tests/fixtures/`](tests/fixtures) — one hand-written session per harness, built to the real
 schema. No mocks, no personal transcripts, no secrets, no harness installs.
 The opencode fixture carries **both** schemas in one file — the legacy
@@ -560,7 +568,7 @@ the harness version recorded in `VERSIONS.json`. Those test the format
 itself, not someone's idea of it. CI scans them for leaks on every push
 (verified against a planted one).
 
-live suite** (286 checks) does the same assertions against your actual
+live suite** (296 checks) does the same assertions against your actual
 sessions — it discovers a real session per harness at runtime, and checks the
 sanitized captures. Stronger, but only works on a machine where those
 harnesses are installed.
@@ -587,7 +595,7 @@ misfiled as the model talking to itself, which is exactly what happened before I
 | [`install.sh`](install.sh) | the installer — 23 agents, [`--list` / `--agent` / `--project` / `--cli` / `--dry-run` / `--uninstall`](#install) |
 | [`skills/session-time-machine/SKILL.md`](skills/session-time-machine/SKILL.md) | **the agent-facing reference**: row shape, per-harness notes, fidelity contract, gotchas |
 | [`skills/session-time-machine/scripts/sessions.py`](skills/session-time-machine/scripts/sessions.py) | the whole tool — one stdlib-only file, both the [`stm` CLI](#verbs) and the flag form |
-| [`skills/session-time-machine/scripts/test_sessions.py`](skills/session-time-machine/scripts/test_sessions.py) | the [live suite](#development) (286 checks) |
+| [`skills/session-time-machine/scripts/test_sessions.py`](skills/session-time-machine/scripts/test_sessions.py) | the [live suite](#development) (296 checks) |
 | [`skills/session-time-machine/references/message-fidelity.md`](skills/session-time-machine/references/message-fidelity.md) | depth on the row-tag taxonomy and what `complete` means |
 | [`tests/run_fixtures.sh`](tests/run_fixtures.sh) | the fixture runner — points the [env overrides](#roots) at the corpus |
 | [`tests/fixtures/`](tests/fixtures) | one synthetic session per harness, built to the real schema |

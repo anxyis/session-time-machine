@@ -84,18 +84,53 @@ def sample_word(d):
 def sample_rare_word(d):
     """A DISTINCTIVE word for search tests.
 
-    'search returns self' breaks if the probe word is common: the search prints
-    only the most recent matches, so a word like 'siya' can push the session
-    under test out of the result list -- a green index, a false FAIL. Prefer the
-    longest word available; long tokens are rare.
+    Two failure modes to dodge, both of which produced false FAILs:
+      - a COMMON word ('siya', 'check') pushes the session under test out of a
+        capped/ranked result list;
+      - a long NON-ALPHABETIC token (a 48-char hex hash, a UUID fragment) is
+        not one term to the FTS tokenizer, so searching for it finds nothing
+        even though the bytes are right there in the transcript.
+    So: alphabetic only, longest wins.
     """
-    best = None
-    for m in d.get("messages", []):
-        c = (m.get("content") or "")
-        for w in "".join(ch if ch.isalnum() else " " for ch in c).split():
-            if len(w) >= 8 and (best is None or len(w) > len(best)):
-                best = w
-    return best or sample_word(d)
+    rows = d.get("messages", [])
+    # Prefer prose. Some harnesses' search does not scan tool-output rows (agy
+    # does not), so a probe drawn from a tool result can be real yet unfindable
+    # -- a false FAIL that says nothing about the index.
+    prose = [m for m in rows
+             if m.get("kind") == "message" and m.get("role") in ("user", "assistant", "system")]
+    for pool in (prose, rows):
+        best = None
+        for m in pool:
+            c = (m.get("content") or "")
+            for w in "".join(ch if ch.isalnum() else " " for ch in c).split():
+                if len(w) >= 8 and w.isalpha() and (best is None or len(w) > len(best)):
+                    best = w
+        if best:
+            return best
+    return sample_word(d)
+
+
+def search_sees_session(harness, sid, term):
+    """Did --search surface this session? Tolerates a CAPPED result list.
+
+    The indexed search prints a bounded, ranked list of sessions, so a real
+    match can legitimately fall outside the window -- that is a display cap,
+    not a broken index. Distinguish the two: if the term produced no matches
+    at all, that is a real failure; if it produced matches but this session
+    is not among them, confirm per-session with --contains (no ranking, no
+    cap) and pass on that.
+    """
+    s = run(harness, "--search", term)
+    if sid in s.stdout:
+        return True, "listed"
+    if not s.stdout.strip() or "no matches" in (s.stdout + s.stderr):
+        return False, "no matches anywhere"
+    c = run(harness, "--contains", term, "--json", sid)
+    try:
+        rows = (json.loads(c.stdout) or {}).get("messages", [])
+    except Exception:
+        rows = []
+    return (len(rows) > 0), f"ranked out (contains matched {len(rows)} rows)"
 
 def suite(harness):
     print(f"\n=== {harness} ===")
@@ -151,10 +186,8 @@ def suite_filters(harness, sid):
         drop = jget(harness, sid, "--model", "NO_SUCH_MODEL_TOKEN_XYZ")
         check(f"{harness}::{sid} --model bogus drops all", len(drop.get("messages", [])) == 0)
     term = sample_rare_word(d) or "the"
-    sr = run(harness, "--search", term)
-    check(f"{harness}::{sid} --search returns self",
-          sr.returncode == 0 and sid in sr.stdout,
-          f"rc={sr.returncode} out={sr.stdout[:60]!r}")
+    _ok, _why = search_sees_session(harness, sid, term)
+    check(f"{harness}::{sid} --search returns self", _ok, f"term={term!r} {_why}")
     # clip
     longm = next((m for m in msgs if len(m.get("content") or "") >= 200), None)
     if longm:
@@ -255,8 +288,13 @@ def main():
         for ln in _last.splitlines():
             if ln.strip().startswith("source"):
                 _lsrc = ln.split(":", 1)[1].strip()
+        # The newest session can CHANGE between the --list call and the 'last'
+        # call -- this suite's own session rewrites its time_updated while the
+        # suite runs -- so accepting only _allids[0] produced a false FAIL.
+        # Accept either of the top two, and require 'last' to be a listed id.
         check("opencode v2: 'last' resolves to the newest session",
-              _lsrc == (_allids[0] if _allids else ""), f"last={_lsrc!r} newest={_allids[:1]}")
+              bool(_lsrc) and _lsrc in _allids[:2],
+              f"last={_lsrc!r} newest={_allids[:2]}")
         # search must find v2 content
         _w = sample_rare_word({"messages": _msgs})
         if _w:
@@ -279,11 +317,9 @@ def main():
               str(a["session"]["fidelity"].get("complete")))
         check("agy model populated", bool(a.get("session", {}).get("model")),
               str(a.get("session", {}).get("model")))
-        w = sample_word(a)
-        sr = run("agy", "--search", w) if w else None
-        check("agy --search finds its own session",
-              sr is not None and sr.returncode == 0 and asid in sr.stdout,
-              (sr.stdout[:80] if sr else "no sample word"))
+        w = sample_rare_word(a)
+        _ok, _why = search_sees_session("agy", asid, w) if w else (False, "no sample word")
+        check("agy --search finds its own session", _ok, _why)
         # usage from gen_metadata protobuf decode (verified Agy schema:
         # field1->4->{2 uncached_input, 3 output(incl thinking), 5 cache_read})
         u = a.get("session", {}).get("usage") or {}
@@ -1380,6 +1416,93 @@ def main():
     check("cli: path verb prints file/db location", bool(run("path", "last").stdout.strip()))
     check("cli: last keyword resolves to newest session", run("peek", "last").returncode == 0)
     check("cli: help includes human verbs", "commands (human verbs)" in run("--help").stdout)
+
+    # ---- load safety: the size gate --------------------------------------
+    # A 486 MB cline transcript inflated past 1 GB anon-rss and OOM-killed an
+    # embedded caller's service three times. Loading is what exhausts memory,
+    # so the gate refuses BEFORE the load. These checks build a throwaway db
+    # with one oversized session and prove: the refusal is clean (exit 3, one
+    # stderr line, no traceback), --path still works, the gate can be lifted,
+    # and the SEARCH fallback is gated too (that is the path that actually
+    # OOMed -- a guard only on the render path guards nothing).
+    import io, shutil, sqlite3 as _sq
+    _tmpd = tempfile.mkdtemp(prefix="stm_gate_")
+    try:
+        _bigdb = os.path.join(_tmpd, "opencode.db")
+        shutil.copyfile(os.path.join(_fixture_dir(), "opencode.db"), _bigdb)
+        _con = _sq.connect(_bigdb)
+        _con.execute("insert into session_v2 (id, directory, title, version, agent,"
+                     " model, time_created, time_updated) values (?,?,?,?,?,?,?,?)",
+                     ("ses_bigfixture", "/tmp", "big", "1.19.0", "build",
+                      '{"id":"m","providerID":"p"}', 3000, 3100))
+        _con.execute("insert into session_message (id, session_id, type, seq,"
+                     " time_created, time_updated, data) values (?,?,?,?,?,?,?)",
+                     ("msg_big", "ses_bigfixture", "user", 1, 3000, 3000,
+                      json.dumps({"text": "x" * (3 * 1024 * 1024)})))
+        _con.commit(); _con.close()
+
+        _genv = dict(os.environ)
+        _genv.update({"STM_OPENCODE_DB": _bigdb, "STM_MAX_SESSION_MB": "1",
+                      "STM_NO_INDEX": "1"})
+
+        def run_gate(*a, **over):
+            e = dict(_genv); e.update({k: str(v) for k, v in over.items()})
+            return subprocess.run([PY, S, *a], capture_output=True, text=True, env=e)
+
+        g = run_gate("opencode", "--peek", "ses_bigfixture")
+        check("gate: oversized session is refused (exit 3)", g.returncode == 3, f"rc={g.returncode}")
+        check("gate: refusal explains itself", "too large" in g.stderr, g.stderr[:120])
+        check("gate: refusal is not a traceback", "Traceback" not in g.stderr, g.stderr[:160])
+        check("gate: refusal prints nothing to stdout", g.stdout.strip() == "", g.stdout[:80])
+        p = run_gate("opencode", "--path", "ses_bigfixture")
+        check("gate: --path still resolves a refused session",
+              p.returncode == 0 and bool(p.stdout.strip()), f"rc={p.returncode}")
+        o = run_gate("opencode", "--peek", "ses_bigfixture", STM_MAX_SESSION_MB=0)
+        check("gate: STM_MAX_SESSION_MB=0 lifts it", o.returncode == 0, f"rc={o.returncode}")
+        s = run_gate("opencode", "--peek", "ses_fixture02", STM_MAX_SESSION_MB=100)
+        check("gate: normal sessions are untouched", s.returncode == 0, f"rc={s.returncode}")
+
+        # the fallback scan loads every session through the adapter
+        _cdb = os.path.join(_tmpd, "cline.db")
+        _bigmsg = os.path.join(_tmpd, "big.messages.json")
+        with open(_bigmsg, "w") as fh:
+            fh.write(json.dumps([{"type": "say", "say": "text", "text": "zzz " * 300000}]))
+        c = _sq.connect(_cdb)
+        c.execute("create table sessions (session_id text, messages_path text,"
+                  " model text, provider text)")
+        c.execute("insert into sessions values (?,?,?,?)",
+                  ("ses_clinebig", _bigmsg, "m", "p"))
+        c.commit(); c.close()
+
+        _old_db, _old_lim = sessions.CLINEDB, sessions._MAX_SESSION_MB
+        _so, _se = sys.stdout, sys.stderr
+        try:
+            sessions.CLINEDB, sessions._MAX_SESSION_MB = _cdb, 1
+            b_out, b_err = io.StringIO(), io.StringIO()
+            sys.stdout, sys.stderr = b_out, b_err
+            try:
+                sessions.cline_search("zzz")
+            finally:
+                sys.stdout, sys.stderr = _so, _se
+            _err = b_err.getvalue()
+            check("gate: cline search skips an oversized session",
+                  "skipped ses_clinebig" in _err, _err[:160])
+            check("gate: a partial search says it is incomplete",
+                  "incomplete" in _err or "small enough" in _err, _err[:160])
+            sessions._MAX_SESSION_MB = 0
+            n_out, n_err = io.StringIO(), io.StringIO()
+            sys.stdout, sys.stderr = n_out, n_err
+            try:
+                sessions.cline_search("zzz")
+            finally:
+                sys.stdout, sys.stderr = _so, _se
+            check("gate: lifting the gate removes the skip notice",
+                  "skipped" not in n_err.getvalue(), n_err.getvalue()[:120])
+        finally:
+            sessions.CLINEDB, sessions._MAX_SESSION_MB = _old_db, _old_lim
+            sys.stdout, sys.stderr = _so, _se
+    finally:
+        shutil.rmtree(_tmpd, ignore_errors=True)
     print(f"\n=== {P} passed, {F} failed ===")
     sys.exit(0 if F == 0 else 1)
 

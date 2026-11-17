@@ -20,8 +20,21 @@ jobs:
       matrix:
         # more than one python, more than one os: the tool is stdlib-only
         # and claims to work on macOS (bash 3.2) and Windows
-        os: [ubuntu-latest, macos-latest]
-        python: ['3.9', '3.11']
+        #
+        # ubuntu-latest moved to Ubuntu 26 on 2026-10-19, and there is no
+        # Python 3.9 build for it -- setup-python fails the job before a
+        # single test runs. The 3.9 leg is pinned to ubuntu-22.04, the last
+        # LTS that ships it; 3.11 keeps the ubuntu-latest leg so the newest
+        # runner stays covered.
+        include:
+          - os: ubuntu-22.04
+            python: '3.9'
+          - os: ubuntu-latest
+            python: '3.11'
+          - os: macos-latest
+            python: '3.9'
+          - os: macos-latest
+            python: '3.11'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5

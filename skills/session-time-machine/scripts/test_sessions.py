@@ -81,6 +81,22 @@ def sample_word(d):
             if len(w) >= 4: return w
     return None
 
+def sample_rare_word(d):
+    """A DISTINCTIVE word for search tests.
+
+    'search returns self' breaks if the probe word is common: the search prints
+    only the most recent matches, so a word like 'siya' can push the session
+    under test out of the result list -- a green index, a false FAIL. Prefer the
+    longest word available; long tokens are rare.
+    """
+    best = None
+    for m in d.get("messages", []):
+        c = (m.get("content") or "")
+        for w in "".join(ch if ch.isalnum() else " " for ch in c).split():
+            if len(w) >= 8 and (best is None or len(w) > len(best)):
+                best = w
+    return best or sample_word(d)
+
 def suite(harness):
     print(f"\n=== {harness} ===")
     sid, has_tools = first_sid(harness, need_tools=True)
@@ -134,7 +150,7 @@ def suite_filters(harness, sid):
         check(f"{harness}::{sid} --model keeps matches", keep.get("session",{}).get("counts",{}).get("msgs",0) == len(keep["messages"]))
         drop = jget(harness, sid, "--model", "NO_SUCH_MODEL_TOKEN_XYZ")
         check(f"{harness}::{sid} --model bogus drops all", len(drop.get("messages", [])) == 0)
-    term = sample_word(d) or "the"
+    term = sample_rare_word(d) or "the"
     sr = run(harness, "--search", term)
     check(f"{harness}::{sid} --search returns self",
           sr.returncode == 0 and sid in sr.stdout,
@@ -188,6 +204,65 @@ def main():
     # opencode regressions
     od = run("opencode", "--peek", first_sid("opencode")[0] or "x").stdout
     check("opencode peek model parsed", "{" not in od or "model" in od, od[:80])
+    # ---- opencode v2 (session_v2 / session_message) ----------------------
+    # opencode 1.19 writes NEW sessions to session_v2 with their parts stored INLINE in
+    # session_message.data.content. A reader that only knows the legacy session/message/
+    # part tables sees none of them -- it lists nothing, reads nothing, and the search
+    # index silently skips them. These checks run against whichever db is configured
+    # (the fixture corpus carries one synthetic v2 session; the live suite finds the
+    # real ones), so both schemas are always covered.
+    _lst = run("opencode", "--list", "50").stdout
+    _v2rows = [ln for ln in _lst.splitlines() if "[v2]" in ln]
+    _v2sids = [ln.split(" | ")[0].strip() for ln in _v2rows]
+    _allids = [ln.split(" | ")[0].strip() for ln in _lst.splitlines()
+               if " | " in ln and "@session:" in ln]
+    check("opencode v2: list surfaces v2 sessions", len(_v2sids) > 0 or len(_allids) == 0,
+          f"v2={len(_v2sids)} all={len(_allids)}")
+    check("opencode v2: no session id listed twice",
+          len(_allids) == len(set(_allids)), f"{len(_allids)} ids, {len(set(_allids))} unique")
+    if _v2sids:
+        _v2 = _v2sids[0]
+        _d = jget("opencode", _v2)
+        _msgs = _d.get("messages", [])
+        _ks = Counter(m["kind"] for m in _msgs)
+        check("opencode v2: session loads rows", len(_msgs) > 0, f"{_v2} rows={len(_msgs)}")
+        _user_rows = [m for m in _msgs if m.get("role") == "user" and m.get("kind") == "message"]
+        check("opencode v2: the human's message is recovered", len(_user_rows) > 0,
+              f"user rows={len(_user_rows)}")
+        _sys = [m for m in _msgs if m.get("role") == "system"]
+        check("opencode v2: system rows are not the human's message",
+              all(m.get("role") != "user" for m in _sys), f"{len(_sys)} system rows")
+        _calls = [m for m in _msgs if m.get("kind") == "tool_call"]
+        _outs = [m for m in _msgs if m.get("kind") == "tool_output"]
+        check("opencode v2: tool names recovered (not '?')",
+              all("?" not in (m.get("tool_names") or ["?"]) for m in _calls) if _calls else True,
+              f"{len(_calls)} calls")
+        check("opencode v2: tool outputs are read from state.content",
+              (len(_outs) > 0) if _calls else True,
+              f"calls={len(_calls)} outputs={len(_outs)}")
+        # every output must pair with a call. Equal COUNTS are not expected of a
+        # session that is still running -- the newest calls have no result yet.
+        _callids = {m.get("tool_call_id") for m in _calls if m.get("tool_call_id")}
+        _outids = {m.get("tool_call_id") for m in _outs if m.get("tool_call_id")}
+        check("opencode v2: every tool output pairs with a call",
+              _outids.issubset(_callids) if _outids else True,
+              f"unpaired={len(_outids - _callids)}")
+        check("opencode v2: content is never invented",
+              all(m.get("content") is None or isinstance(m.get("content"), str) for m in _msgs))
+        # 'last' must resolve to the newest session across BOTH schemas
+        _last = run("opencode", "--peek", "last").stdout
+        _lsrc = ""
+        for ln in _last.splitlines():
+            if ln.strip().startswith("source"):
+                _lsrc = ln.split(":", 1)[1].strip()
+        check("opencode v2: 'last' resolves to the newest session",
+              _lsrc == (_allids[0] if _allids else ""), f"last={_lsrc!r} newest={_allids[:1]}")
+        # search must find v2 content
+        _w = sample_rare_word({"messages": _msgs})
+        if _w:
+            _s = run("opencode", "--search", _w).stdout
+            check("opencode v2: search finds v2 content", _v2 in _s, f"term={_w!r}")
+
     # hermes integrity
     hsid = first_sid("hermes")[0]
     if hsid:

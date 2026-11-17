@@ -709,11 +709,22 @@ def _hermes_rows(sid):
             out.append(row("hermes", sid, i, "user", ist(ts), "message", content=content,
                            model=model, provider=provider, epoch=ts, tags=[ctx]))
     return out
-# ---------- OPENCODE adapter (V2: message=metadata, part=content) ----------
+# ---------- OPENCODE adapter ----------
+# Two schemas live in the same sqlite file:
+#   v1 (legacy)  : session / message / part   -- parts are separate rows
+#   v2 (>=1.19)   : session_v2 / session_message -- parts are INLINE in data.content
+# opencode 1.19 started writing NEW sessions to v2 and left the legacy tables
+# holding only the old ones. Every path below reads both, so a session is
+# visible whichever schema it was written in.
 
 def _infer_provider(m):
     if not m: return None
     m = m.lower()
+    # "model-id (provider)" -- the shape _oc_modelstr produces for both schemas
+    if m.endswith(")") and "(" in m:
+        inner = m.rsplit("(", 1)[1][:-1].strip()
+        if inner:
+            return inner
     if m.startswith(("gpt","o1","o3","o4")): return "openai"
     if m.startswith("claude"): return "anthropic"
     if m.startswith(("command","cmd")): return "command"
@@ -733,54 +744,178 @@ def _oc_modelstr(m):
             pass
     return str(m)
 
+def _oc_tables(db):
+    """Which opencode schemas exist in this db."""
+    tabs = {r[0] for r in db.execute("select name from sqlite_master where type='table'")}
+    return {
+        "v1": "session" in tabs,
+        "v1msg": "message" in tabs,
+        "v1part": "part" in tabs,
+        "v2": "session_v2" in tabs,
+        "v2msg": "session_message" in tabs,
+        "v2part": "session_part" in tabs,
+    }
+
+def _oc_cols(db, table):
+    try:
+        return [c[1] for c in db.execute(f"pragma table_info({table})")]
+    except Exception:
+        return []
+
+def _oc_session_rows(db):
+    """Every opencode session as (id, time_ms, title, model, schema), newest first.
+
+    One source of truth: list, search, load, 'last', prefix matching and the
+    search index all read this, so a session cannot be visible in one path
+    and invisible in another. An id present in BOTH tables appears once --
+    v2 wins, because v2 is the live schema.
+    """
+    t = _oc_tables(db)
+    rows = []
+    if t["v1"]:
+        cols = _oc_cols(db, "session")
+        oc = "time_updated" if "time_updated" in cols else ("time_created" if "time_created" in cols else "id")
+        sel = ["id", oc] + (["title"] if "title" in cols else []) + (["model"] if "model" in cols else [])
+        for r in db.execute(f"select {','.join(sel)} from session").fetchall():
+            rows.append((r[0], r[1], r[2] if len(r) > 2 else None, r[3] if len(r) > 3 else None, "v1"))
+    if t["v2"]:
+        cols = _oc_cols(db, "session_v2")
+        oc = "time_updated" if "time_updated" in cols else ("time_created" if "time_created" in cols else "id")
+        sel = ["id", oc] + (["title"] if "title" in cols else []) + (["model"] if "model" in cols else [])
+        for r in db.execute(f"select {','.join(sel)} from session_v2").fetchall():
+            rows.append((r[0], r[1], r[2] if len(r) > 2 else None, r[3] if len(r) > 3 else None, "v2"))
+    best = {}
+    for sid, ts, title, model, schema in rows:
+        if sid not in best or schema == "v2":
+            best[sid] = (sid, ts, title, model, schema)
+    out = list(best.values())
+    out.sort(key=lambda r: (r[1] or 0), reverse=True)
+    return out
+
+def _oc_schema_of(db, sid):
+    """'v2', 'v1' or None for one session id."""
+    t = _oc_tables(db)
+    if t["v2"] and db.execute("select 1 from session_v2 where id=?", (sid,)).fetchone():
+        return "v2"
+    if t["v1"] and db.execute("select 1 from session where id=?", (sid,)).fetchone():
+        return "v1"
+    return None
+
 def opencode_list(n):
     db = ro(ODB)
-    cols = [c[1] for c in db.execute("pragma table_info(session)")]
-    extra = ", ".join(c for c in ("project_id","directory","agent") if c in cols)
-    q = f"select id, time_updated, title, model {extra and ', '+extra} from session order by time_updated desc limit ?"
-    shown = db.execute(q, (n,)).fetchall()
+    rows = _oc_session_rows(db)
+    shown = rows[:n]
     print(f"## opencode sessions ({len(shown)} shown) | newest first | model|provider inferred")
-    for rowv in shown:
-        sid = rowv[0]; ts = ist(rowv[1]/1000.0) if rowv[1] else "?"
-        model = _oc_modelstr(rowv[3] if len(rowv) > 3 else None)
+    for sid, ts, title, model_raw, schema in shown:
+        when = ist((ts or 0)/1000.0) if isinstance(ts, (int, float)) else "?"
+        model = _oc_modelstr(model_raw)
         prov = _infer_provider(model)
-        title = rowv[2] if len(rowv) > 2 else "-"
-        print(f"{sid} | opencode | {ts} | {clip(model,20)} via {clip(prov or '?',8)} | {clip(title,40)} | @session:opencode/{sid}")
+        tag = "" if schema == "v1" else " [v2]"
+        print(f"{sid} | opencode | {when} | {clip(model,20)} via {clip(prov or '?',8)} | {clip(title or '-',40)} | @session:opencode/{sid}{tag}")
 
 def opencode_search(term):
     db = ro(ODB)
+    t = _oc_tables(db)
+    models = {sid: model for sid, _ts, _ti, model, _s in _oc_session_rows(db)}
     pat = "%" + term.replace("%", r"\%").replace("_", r"\_") + "%"
-    res = db.execute("select s.id, s.model, m.time_created, p.data from part p "
-                     "join session s on s.id=p.session_id join message m on m.id=p.message_id "
-                     "where json_extract(p.data,'$.type')='text' "
-                     "and json_extract(p.data,'$.text') like ? escape '\\' "
-                     "order by m.time_created desc limit 12", (pat,)).fetchall()
-    for sid, model, ts, data in res:
-        txt = json.loads(data or {}); snippet = clip(txt.get("text",""), 110)
-        print(f"{sid} | {_oc_modelstr(model)} | {ist(ts/1000.0)} | {snippet}")
-    if not res: print("(no matches)", file=sys.stderr)
+    found = False
+    if t["v1"] and t["v1msg"] and t["v1part"]:
+        res = db.execute("select s.id, m.time_created, p.data from part p "
+                         "join session s on s.id=p.session_id join message m on m.id=p.message_id "
+                         "where json_extract(p.data,'$.type')='text' "
+                         "and json_extract(p.data,'$.text') like ? escape '\\' "
+                         "order by m.time_created desc limit 12", (pat,)).fetchall()
+        for sid, ts, data in res:
+            txt = json.loads(data or {}); snippet = clip(txt.get("text",""), 110)
+            print(f"{sid} | {_oc_modelstr(models.get(sid))} | {ist((ts or 0)/1000.0)} | {snippet}")
+            found = True
+    if t["v2"] and t["v2msg"]:
+        # v2 keeps the whole message (role + parts) inline in session_message.data
+        res2 = db.execute("select session_id, time_created, data from session_message "
+                          "where data like ? escape '\\' "
+                          "order by time_created desc limit 12", (pat,)).fetchall()
+        for sid, ts, data in res2:
+            try: md = json.loads(data or "{}")
+            except Exception: md = {}
+            snippet = ""
+            if isinstance(md.get("text"), str) and md.get("text").strip():
+                snippet = clip(md["text"], 110)
+            else:
+                for p in (md.get("content") or []):
+                    if isinstance(p, dict) and p.get("type") == "text" and p.get("text"):
+                        snippet = clip(p["text"], 110); break
+            if snippet:
+                print(f"{sid} | {_oc_modelstr(models.get(sid))} | {ist((ts or 0)/1000.0)} | {snippet}")
+                found = True
+    if not found: print("(no matches)", file=sys.stderr)
 
 def _opencode_load(sid):
     db = ro(ODB)
-    msgs = db.execute("SELECT id, time_created, data FROM message WHERE session_id=? ORDER BY time_created ASC", (sid,)).fetchall()
+    t = _oc_tables(db)
+    schema = _oc_schema_of(db, sid)
+    msgs = []      # (message_id, time_ms, role, [parts])
+    model = "?"
+    if schema == "v2" and t["v2msg"]:
+        # opencode >= 1.19: registry = session_v2, messages = session_message, and every
+        # message carries its role + its parts INLINE in data.content.
+        v2rows = db.execute("select id, type, seq, time_created, data from session_message "
+                            "where session_id=? order by seq asc, time_created asc", (sid,)).fetchall()
+        for mid, mtype, mseq, ts, mdata in v2rows:
+            try: md = json.loads(mdata or "{}")
+            except Exception: md = {}
+            role = mtype if mtype in ("user","assistant","system") else (md.get("role") or mtype or "?")
+            content = md.get("content")
+            if isinstance(content, list):
+                plist = [p for p in content if isinstance(p, dict)]
+            elif isinstance(content, str) and content.strip():
+                plist = [{"type": "text", "text": content}]
+            elif isinstance(md.get("text"), str) and md.get("text").strip():
+                plist = [{"type": "text", "text": md["text"]}]
+            else:
+                plist = []
+            msgs.append((mid, ts, role, plist))
+        if t["v2part"]:
+            # a future opencode may move parts into session_part -- use them only to fill
+            # gaps, never to override the inline copies.
+            try:
+                rows = db.execute("select message_id, ordinal, data from session_part "
+                                  "where session_id=? order by message_id, ordinal asc", (sid,)).fetchall()
+                bym = {}
+                for mid, ordv, pdata in rows:
+                    try: bym.setdefault(mid, []).append(json.loads(pdata))
+                    except Exception: pass
+                if bym:
+                    msgs = [(mid, ts, role, (plist if plist else bym.get(mid, []))) for mid, ts, role, plist in msgs]
+            except Exception:
+                pass
+        mrow = db.execute("select model from session_v2 where id=?", (sid,)).fetchone()
+        model = _oc_modelstr(mrow and mrow[0])
     if not msgs:
-        return [], {"source": sid, "harness": "opencode", "note": "NOT FOUND (no messages)"}
-    mrow = db.execute("select model from session where id=?", (sid,)).fetchone()
-    model = _oc_modelstr(mrow and mrow[0])
+        # v1: message = metadata row, part = one content row
+        v1rows = db.execute("SELECT id, time_created, data FROM message WHERE session_id=? "
+                            "ORDER BY time_created ASC", (sid,)).fetchall()
+        if not v1rows:
+            return [], {"source": sid, "harness": "opencode", "note": "NOT FOUND (no messages)"}
+        pids = [m[0] for m in v1rows]
+        parts = {}
+        if pids and t["v1part"]:
+            q = ("select message_id, data from part where message_id in (%s) "
+                 "order by message_id, time_created ASC") % ",".join("?"*len(pids))
+            for mid, pdata in db.execute(q, pids).fetchall():
+                try: parts.setdefault(mid, []).append(json.loads(pdata))
+                except Exception: pass
+        for mid, ts, mdata in v1rows:
+            try: md = json.loads(mdata or "{}")
+            except Exception: md = {}
+            msgs.append((mid, ts, md.get("role", "?"), parts.get(mid, [])))
+        mrow = db.execute("select model from session where id=?", (sid,)).fetchone()
+        model = _oc_modelstr(mrow and mrow[0])
     info = {"model": model, "provider": _infer_provider(model), "source": sid}
-    pids = [m[0] for m in msgs]
-    parts = {}
-    if pids:
-        q = "select message_id, data from part where message_id in (%s) order by message_id, time_created ASC" % ",".join("?"*len(pids))
-        for mid, pdata in db.execute(q, pids).fetchall():
-            try: parts.setdefault(mid, []).append(json.loads(pdata))
-            except Exception: info.setdefault("unrecovered", []).append("1 unparseable part JSON skipped")
+    if schema == "v2": info["schema"] = "v2"
     out = []; seq = 0; skipped = collections.defaultdict(int)
-    for mid, ts, mdata in msgs:
-        md = json.loads(mdata or "{}")
-        role = md.get("role", "?")
+    for mid, ts, role, plist in msgs:
         epoch = (ts or 0) / 1000.0; t = ist(epoch)
-        for p in parts.get(mid, []):
+        for p in plist:
             pt = p.get("type")
             if pt in ("step-start", "step-finish", "compaction", "agent"):
                 skipped[pt] += 1; continue
@@ -795,15 +930,25 @@ def _opencode_load(sid):
                                    model=model, provider=info["provider"], epoch=epoch)); seq += 1
             elif pt == "tool":
                 st = p.get("state") or {}
-                nm = p.get("tool") or "?"
+                # v1 part: tool=<name>, state.output=<text>.  v2 part (opencode >=1.19):
+                # name=<name>, state.content=[{type:text,text:...}] blocks.
+                nm = p.get("tool") or p.get("name") or "?"
                 is_err = st.get("status") in ("error", "failed", "cancelled")
                 out.append(row("opencode", sid, seq, role, t, "tool_call", content=_verbatim(st.get("input")),
                                tool_names=[nm],
-                               tool_call_id=p.get("callID"), is_error=is_err, model=model,
+                               tool_call_id=p.get("callID") or p.get("id"), is_error=is_err, model=model,
                                provider=info["provider"], epoch=epoch,
                                sub=f"tool_call: {nm} | status={st.get('status','?')}")); seq += 1
                 outv = st.get("output")
                 if isinstance(outv, dict): outv = outv.get("output")
+                if not outv:
+                    blocks = st.get("content")
+                    if isinstance(blocks, list):
+                        texts = [b.get("text") for b in blocks
+                                 if isinstance(b, dict) and b.get("type") == "text" and b.get("text")]
+                        if texts: outv = "".join(texts)
+                    elif isinstance(blocks, str):
+                        outv = blocks
                 if outv:
                     out.append(row("opencode", sid, seq, "tool", t, "tool_output", content=str(outv),
                                    model=model, provider=info["provider"], epoch=epoch)); seq += 1
@@ -3467,9 +3612,10 @@ def _all_session_ids(harness):
             ids = [r[0] for r in db.execute("select id from sessions").fetchall()]
         elif harness == "opencode":
             db = ro(ODB)
-            cols = [c[1] for c in db.execute("pragma table_info(session)")]
-            if "id" in cols:
-                ids = [r[0] for r in db.execute("select id from session").fetchall()]
+            # both schemas (legacy `session` + opencode >=1.19 `session_v2`). Without v2
+            # here, every session created since the upgrade is invisible to prefix
+            # matching and to the search index.
+            ids = [r[0] for r in _oc_session_rows(db)]
         elif harness == "cline":
             db = ro(CLINEDB)
             ids = [r[0] for r in db.execute("select session_id from sessions").fetchall()]
@@ -3914,12 +4060,11 @@ def _get_latest_session(harness):
                 return (epoch, row[0], "hermes")
         elif harness == "opencode":
             db = ro(ODB)
-            cols = [c[1] for c in db.execute("pragma table_info(session)")]
-            order_col = "time_updated" if "time_updated" in cols else ("time_created" if "time_created" in cols else "id")
-            row = db.execute(f"select id, {order_col} from session order by {order_col} desc limit 1").fetchone()
-            if row:
-                epoch = to_epoch(row[1]) or 0
-                return (epoch, row[0], "opencode")
+            rows = _oc_session_rows(db)      # both schemas, newest first
+            if rows:
+                sid, ts, _title, _model, _schema = rows[0]
+                epoch = to_epoch(ts) or 0
+                return (epoch, sid, "opencode")
         elif harness == "cline":
             db = ro(CLINEDB)
             cols = [c[1] for c in db.execute("pragma table_info(sessions)")]

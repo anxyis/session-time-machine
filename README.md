@@ -11,8 +11,8 @@
   <img src="https://img.shields.io/badge/deps-none-5865F2" alt="No dependencies" />
   <a href="#problem"><img src="https://img.shields.io/badge/harnesses-7-ff69b4" alt="7 harnesses" /></a>
   <a href="https://github.com/anxyis/session-time-machine/actions/workflows/test.yml"><img src="https://github.com/anxyis/session-time-machine/actions/workflows/test.yml/badge.svg?branch=main" alt="CI" /></a>
-  <a href="#development"><img src="https://img.shields.io/badge/fixture%20suite-272%2F272-4CAF50" alt="272/272 fixture tests" /></a>
-  <a href="#development"><img src="https://img.shields.io/badge/live%20suite-275%2F275-4CAF50" alt="275/275 live tests" /></a>
+  <a href="#development"><img src="https://img.shields.io/badge/fixture%20suite-283%2F283-4CAF50" alt="283/283 fixture tests" /></a>
+  <a href="#development"><img src="https://img.shields.io/badge/live%20suite-286%20checks-4CAF50" alt="286 live checks" /></a>
 </p>
 
 <br/>
@@ -93,7 +93,7 @@ machine buries its history somewhere different:
 | Harness | Where the bones are buried | Adapter notes |
 |---|---|---|
 | **Hermes** | `~/.hermes/state.db` | [epoch seconds](#context-split) · `api_content` recovery |
-| **OpenCode** | `~/.local/share/opencode/opencode.db` | [epoch **ms**](#context-split) · `part`-table search |
+| **OpenCode** | `~/.local/share/opencode/opencode.db` | [epoch **ms**](#context-split) · **two schemas** — legacy `session`/`message`/`part` **and** opencode ≥1.19 `session_v2`/`session_message` (parts inline) |
 | **Cline** | `~/.cline/data/db/sessions.db` + a JSON file it points at | `tool_result` blocks flattened |
 | **Codex** | `~/.codex/sessions/*/*/rollout-*.jsonl` | Responses-API · lifecycle rows hidden |
 | **Antigravity** | `~/.gemini/antigravity-cli/brain/*/…/transcript_full.jsonl` | [16-type enum](#development) · protobuf fallback |
@@ -543,9 +543,13 @@ python3 skills/session-time-machine/scripts/test_sessions.py
 bash tests/run_fixtures.sh
 ```
 
-**fixture suite** (272 checks) runs against a small synthetic corpus in
+**fixture suite** (283 checks) runs against a small synthetic corpus in
 [`tests/fixtures/`](tests/fixtures) — one hand-written session per harness, built to the real
 schema. No mocks, no personal transcripts, no secrets, no harness installs.
+The opencode fixture carries **both** schemas in one file — the legacy
+`session`/`message`/`part` trio and the opencode ≥1.19 `session_v2`/`session_message`
+pair — because a reader that only knows the old shape sees none of the sessions a
+modern opencode actually writes, and fails *silently*.
 It's what CI runs on every push, and what you can run to check the tool still
 parses a format you don't have installed.
 
@@ -556,7 +560,7 @@ the harness version recorded in `VERSIONS.json`. Those test the format
 itself, not someone's idea of it. CI scans them for leaks on every push
 (verified against a planted one).
 
-live suite** (275 checks) does the same assertions against your actual
+live suite** (286 checks) does the same assertions against your actual
 sessions — it discovers a real session per harness at runtime, and checks the
 sanitized captures. Stronger, but only works on a machine where those
 harnesses are installed.
@@ -583,7 +587,7 @@ misfiled as the model talking to itself, which is exactly what happened before I
 | [`install.sh`](install.sh) | the installer — 23 agents, [`--list` / `--agent` / `--project` / `--cli` / `--dry-run` / `--uninstall`](#install) |
 | [`skills/session-time-machine/SKILL.md`](skills/session-time-machine/SKILL.md) | **the agent-facing reference**: row shape, per-harness notes, fidelity contract, gotchas |
 | [`skills/session-time-machine/scripts/sessions.py`](skills/session-time-machine/scripts/sessions.py) | the whole tool — one stdlib-only file, both the [`stm` CLI](#verbs) and the flag form |
-| [`skills/session-time-machine/scripts/test_sessions.py`](skills/session-time-machine/scripts/test_sessions.py) | the [live suite](#development) (275 checks) |
+| [`skills/session-time-machine/scripts/test_sessions.py`](skills/session-time-machine/scripts/test_sessions.py) | the [live suite](#development) (286 checks) |
 | [`skills/session-time-machine/references/message-fidelity.md`](skills/session-time-machine/references/message-fidelity.md) | depth on the row-tag taxonomy and what `complete` means |
 | [`tests/run_fixtures.sh`](tests/run_fixtures.sh) | the fixture runner — points the [env overrides](#roots) at the corpus |
 | [`tests/fixtures/`](tests/fixtures) | one synthetic session per harness, built to the real schema |
